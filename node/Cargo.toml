@@ -68,6 +68,10 @@ name = "benchmark_client"
 path = "src/benchmark_client.rs"
 required-features = ["benchmark"]
 
+[[bin]]
+name = "single_transaction_client"
+path = "src/single_transaction_client.rs"
+
 [[example]]
 name = "generate-format"
 path = "src/generate_format.rs"

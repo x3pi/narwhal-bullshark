@@ -1,0 +1,23 @@
+# Binaries
+single_transaction_client
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Generated proto files
+proto/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+

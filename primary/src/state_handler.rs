@@ -9,7 +9,10 @@ use std::{collections::BTreeMap, sync::Arc};
 use tap::TapOptional;
 use tokio::{sync::watch, task::JoinHandle};
 use tracing::{info, warn};
-use types::{metered_channel::Receiver, Certificate, ReconfigureNotification, Round};
+use types::{
+    metered_channel::{Receiver, Sender},
+    Certificate, ReconfigureNotification, Round,
+};
 
 /// Receives the highest round reached by consensus and update it for all tasks.
 pub struct StateHandler {
@@ -31,6 +34,10 @@ pub struct StateHandler {
     last_committed_round: Round,
     /// A network sender to notify our workers of cleanup events.
     network: P2pNetwork,
+    /// FORK-SAFE: Notify Proposer when certificates are sequenced (committed).
+    /// This allows Proposer to cleanup InFlight batches.
+    /// All nodes receive the same certificates in the same order → deterministic cleanup → fork-safe.
+    tx_proposer_sequenced: Sender<Certificate>,
 }
 
 impl StateHandler {
@@ -44,6 +51,7 @@ impl StateHandler {
         rx_reconfigure: Receiver<ReconfigureNotification>,
         tx_reconfigure: watch::Sender<ReconfigureNotification>,
         network: P2pNetwork,
+        tx_proposer_sequenced: Sender<Certificate>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             Self {
@@ -56,6 +64,7 @@ impl StateHandler {
                 tx_reconfigure,
                 last_committed_round: 0,
                 network,
+                tx_proposer_sequenced,
             }
             .run()
             .await;
@@ -63,11 +72,21 @@ impl StateHandler {
     }
 
     async fn handle_sequenced(&mut self, certificate: Certificate) {
-        // TODO [issue #9]: Re-include batch digests that have not been sequenced into our next block.
+        // ✅ IMPLEMENTED [issue #9]: Re-include batch digests that have not been sequenced into our next block.
+        // Implementation in Proposer:
+        // - Track batches from certified headers as InFlight
+        // - Re-include InFlight batches in new headers
+        // - Cleanup InFlight batches when certificates are sequenced
+        // - Fork-safe: All nodes track the same certified headers → same InFlight state
 
         let round = certificate.round();
         if round > self.last_committed_round {
             self.last_committed_round = round;
+
+            // FORK-SAFE: Notify Proposer about sequenced certificate to cleanup InFlight batches.
+            // All nodes receive the same certificates in the same order → deterministic cleanup → fork-safe.
+            // Ignore error if Proposer channel is closed (shutting down).
+            let _ = self.tx_proposer_sequenced.send(certificate.clone()).await;
 
             // Trigger cleanup on the primary.
             let _ = self.tx_consensus_round_updates.send(round); // ignore error when receivers dropped.

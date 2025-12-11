@@ -10,7 +10,7 @@
 #![allow(clippy::mutable_key_type)]
 
 use arc_swap::ArcSwap;
-use crypto::{NetworkPublicKey, PublicKey};
+use crypto::{KeyPair, NetworkPublicKey, PublicKey};
 use fastcrypto::traits::EncodeDecodeBase64;
 use multiaddr::Multiaddr;
 use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
@@ -135,6 +135,10 @@ pub struct Parameters {
     pub max_concurrent_requests: usize,
     /// Properties for the prometheus metrics
     pub prometheus_metrics: PrometheusMetricsParameters,
+    /// Unix Domain Socket path for sending committed blocks to executor (optional)
+    /// If empty, UdsExecutionState will not be used
+    #[serde(default)]
+    pub uds_block_path: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -260,16 +264,22 @@ impl Default for Parameters {
     fn default() -> Self {
         Self {
             header_size: 1_000,
-            max_header_delay: Duration::from_millis(100),
+            // Tăng max_header_delay để đợi DAG sync đầy đủ hơn (đặc biệt cho localhost)
+            // Điều này giúp giảm tỉ lệ skip batches do thiếu linked path
+            max_header_delay: Duration::from_millis(300),
             gc_depth: 50,
-            sync_retry_delay: Duration::from_millis(5_000),
-            sync_retry_nodes: 3,
+            // Giảm sync_retry_delay để retry nhanh hơn, đảm bảo DAG được sync đầy đủ
+            // Giảm từ 5s xuống 200ms để sync nhanh hơn cho localhost
+            sync_retry_delay: Duration::from_millis(200),
+            // Tăng số nodes để sync khi retry để tăng khả năng sync thành công
+            sync_retry_nodes: 10,
             batch_size: 500_000,
             max_batch_delay: Duration::from_millis(100),
             block_synchronizer: BlockSynchronizerParameters::default(),
             consensus_api_grpc: ConsensusAPIGrpcParameters::default(),
             max_concurrent_requests: 500_000,
             prometheus_metrics: PrometheusMetricsParameters::default(),
+            uds_block_path: String::new(),
         }
     }
 }
@@ -693,6 +703,60 @@ impl Committee {
 
         errors.map(Err).unwrap_or(Ok(()))
     }
+}
+
+/// Extended primary key file format that includes UDS paths
+/// This wraps the standard KeyPair JSON format with additional optional fields
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct PrimaryKeyConfig {
+    /// Standard KeyPair fields (type, name, secret)
+    #[serde(flatten)]
+    pub keypair_json: serde_json::Value,
+    /// Unix Domain Socket path for sending committed blocks to executor (optional)
+    /// If empty or missing, UdsExecutionState will not be used
+    #[serde(default)]
+    pub uds_block_path: String,
+}
+
+impl PrimaryKeyConfig {
+    /// Extract the KeyPair from this config
+    pub fn extract_keypair(&self) -> Result<crypto::KeyPair, ConfigError> {
+        // Serialize the keypair_json part back to JSON string
+        let json_str = serde_json::to_string(&self.keypair_json)
+            .map_err(|e| ConfigError::ImportError {
+                file: "primary-key".to_string(),
+                message: format!("Failed to serialize keypair: {}", e),
+            })?;
+        
+        // Deserialize as KeyPair
+        let keypair: crypto::KeyPair = serde_json::from_str(&json_str)
+            .map_err(|e| ConfigError::ImportError {
+                file: "primary-key".to_string(),
+                message: format!("Failed to deserialize KeyPair: {}", e),
+            })?;
+        
+        Ok(keypair)
+    }
+}
+
+/// Node configuration with UDS paths for integration with external executor
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct NodeConfig {
+    /// Public key of the node
+    pub name: PublicKey,
+    /// Secret key of the node
+    pub secret: String,
+    /// Consensus public key
+    pub consensus_key: String,
+    /// Consensus secret key
+    pub consensus_secret: String,
+    /// Unix Domain Socket path for getting validators (optional)
+    #[serde(default)]
+    pub uds_get_validators_path: String,
+    /// Unix Domain Socket path for sending committed blocks to executor (optional)
+    /// If empty, UdsExecutionState will not be used
+    #[serde(default)]
+    pub uds_block_path: String,
 }
 
 #[cfg(test)]

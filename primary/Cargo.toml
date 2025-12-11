@@ -42,6 +42,7 @@ network = { path = "../network", package = "narwhal-network" }
 types = { path = "../types", package = "narwhal-types" }
 storage = { path = "../storage", package = "narwhal-storage" }
 mysten-network = "0.1.0"
+indexmap = "1.9.1"
 
 store = { git = "https://github.com/x3pi/mysten-infra.git", version = "0.4.0", package = "typed-store" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

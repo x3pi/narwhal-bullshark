@@ -340,8 +340,10 @@ impl Node {
             parameters.gc_depth,
         );
 
+
         // Spawn the client executing the transactions. It can also synchronize with the
         // subscriber handler if it missed some transactions.
+        let mut handles = Vec::new();
         let executor_handles = Executor::spawn(
             name,
             network,
@@ -354,10 +356,10 @@ impl Node {
             restored_consensus_output,
         )?;
 
-        Ok(executor_handles
-            .into_iter()
-            .chain(std::iter::once(consensus_handles))
-            .collect())
+        handles.extend(executor_handles);
+        handles.push(consensus_handles);
+
+        Ok(handles)
     }
 
     /// Spawn a specified number of workers.

@@ -18,6 +18,7 @@ use network::PrimaryToWorkerRpc;
 use anyhow::bail;
 use prometheus::IntGauge;
 use std::future::Future;
+use std::pin::Pin;
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -111,7 +112,7 @@ impl<Network: SubscriberNetwork> Subscriber<Network> {
         // mater if we somehow managed to fetch the batches from a later
         // certificate. Unless the earlier certificate's payload has been
         // fetched, no later certificate will be delivered.
-        let mut waiting = FuturesOrdered::new();
+        let mut waiting: FuturesOrdered<Pin<Box<dyn Future<Output = (BatchIndex, Batch)> + Send>>> = FuturesOrdered::new();
 
         // First handle any consensus output messages that were restored due to a restart.
         // This needs to happen before we start listening on rx_consensus and receive messages sequenced after these.
@@ -171,9 +172,9 @@ impl<Network: SubscriberNetwork> Fetcher<Network> {
     fn fetch_payloads(
         &self,
         deliver: ConsensusOutput,
-    ) -> Vec<impl Future<Output = (BatchIndex, Batch)> + '_> {
+    ) -> Vec<Pin<Box<dyn Future<Output = (BatchIndex, Batch)> + Send + '_>>> {
         debug!("Fetching payload for {:?}", deliver);
-        let mut ret = vec![];
+        let mut ret: Vec<Pin<Box<dyn Future<Output = (BatchIndex, Batch)> + Send + '_>>> = vec![];
         for (batch_index, (digest, worker_id)) in
             deliver.certificate.header.payload.iter().enumerate()
         {
@@ -187,8 +188,27 @@ impl<Network: SubscriberNetwork> Fetcher<Network> {
             };
             workers.shuffle(&mut ThreadRng::default());
             ret.push(
-                self.fetch_payload(*digest, *worker_id, workers)
-                    .map(move |batch| (batch_index, batch)),
+                Box::pin(
+                    self.fetch_payload(*digest, *worker_id, workers)
+                        .map(move |batch| (batch_index, batch))
+                )
+            );
+        }
+
+        // Nếu certificate không có payload, vẫn cần gửi empty batch để execution state có thể xử lý
+        // (đặc biệt quan trọng cho round chẵn cần tạo empty block)
+        if ret.is_empty() {
+            let batch_index = BatchIndex {
+                consensus_output: deliver.clone(),
+                next_certificate_index: deliver.consensus_index,
+                batch_index: 0,
+            };
+            // Tạo async block để tạo empty batch future
+            ret.push(
+                Box::pin(
+                    async move { Batch::default() }
+                        .map(move |batch| (batch_index, batch))
+                )
             );
         }
 

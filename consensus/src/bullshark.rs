@@ -8,7 +8,7 @@ use crate::{
 use config::{Committee, Stake};
 use fastcrypto::{traits::EncodeDecodeBase64, hash::Hash};
 use std::{collections::HashMap, sync::Arc};
-use tracing::debug;
+use tracing::{debug, info, warn};
 use types::{Certificate, CertificateDigest, ConsensusStore, Round, SequenceNumber, StoreResult};
 
 #[cfg(test)]
@@ -55,12 +55,19 @@ impl ConsensusProtocol for Bullshark {
         // there is nothing to do.
         let leader_round = r;
         if leader_round <= state.last_committed_round {
+            debug!("[CONSENSUS] Leader round {} already committed (last_committed_round={})", leader_round, state.last_committed_round);
             return Ok(Vec::new());
         }
         let (leader_digest, leader) = match Self::leader(&self.committee, leader_round, &state.dag)
         {
-            Some(x) => x,
-            None => return Ok(Vec::new()),
+            Some(x) => {
+                info!("✅ [CONSENSUS] Found leader at round {}: LeaderDigest={:?}", leader_round, x.0);
+                x
+            },
+            None => {
+                warn!("⚠️ [CONSENSUS] No leader found at round {} (current round: {})", leader_round, round);
+                return Ok(Vec::new());
+            },
         };
 
         // Check if the leader has f+1 support from its children (ie. round r-1).
@@ -77,17 +84,24 @@ impl ConsensusProtocol for Bullshark {
         // the last committed leader, and commit all preceding leaders in the right order. Committing
         // a leader block means committing all its dependencies.
         if stake < self.committee.validity_threshold() {
-            debug!("Leader {:?} does not have enough support", leader);
+            warn!(
+                "⚠️ [CONSENSUS] Leader at round {} does not have enough support: Stake={}, Threshold={}, LeaderDigest={:?}",
+                leader_round, stake, self.committee.validity_threshold(), leader_digest
+            );
             return Ok(Vec::new());
         }
 
         // Get an ordered list of past leaders that are linked to the current leader.
-        debug!("Leader {:?} has enough support", leader);
+        info!("✅ [CONSENSUS] Leader at round {} has enough support: Stake={} >= Threshold={}", 
+            leader_round, stake, self.committee.validity_threshold());
+        info!("🔍 [CONSENSUS] Calling order_leaders() for leader round {} (last_committed_round={})", 
+            leader_round, state.last_committed_round);
+        let leaders_to_commit = utils::order_leaders(&self.committee, leader, state, Self::leader);
+        info!("📋 [CONSENSUS] order_leaders() returned {} leaders to commit: rounds {:?}", 
+            leaders_to_commit.len(), 
+            leaders_to_commit.iter().map(|l| l.round()).collect::<Vec<_>>());
         let mut sequence = Vec::new();
-        for leader in utils::order_leaders(&self.committee, leader, state, Self::leader)
-            .iter()
-            .rev()
-        {
+        for leader in leaders_to_commit.iter().rev() {
             // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
             for x in utils::order_dag(self.gc_depth, leader, state) {
                 let digest = x.digest();

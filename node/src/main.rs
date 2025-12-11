@@ -10,7 +10,7 @@
 
 use arc_swap::ArcSwap;
 use clap::{crate_name, crate_version, App, AppSettings, ArgMatches, SubCommand};
-use config::{Committee, Import, Parameters, WorkerCache, WorkerId};
+use config::{Committee, Import, Parameters, PrimaryKeyConfig, WorkerCache, WorkerId};
 use crypto::{KeyPair, NetworkKeyPair};
 use executor::SerializedTransaction;
 use eyre::Context;
@@ -18,7 +18,7 @@ use fastcrypto::{generate_production_keypair, traits::KeyPair as _};
 use futures::future::join_all;
 use narwhal_node as node;
 use node::{
-    execution_state::SimpleExecutionState,
+    execution_state::{SimpleExecutionState, UdsExecutionState},
     metrics::{primary_metrics_registry, start_prometheus_server, worker_metrics_registry},
     Node, NodeStorage,
 };
@@ -35,6 +35,10 @@ use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
+
+
+/// The default channel capacity.
+pub const CHANNEL_CAPACITY: usize = 5_000;
 
 #[tokio::main]
 async fn main() -> Result<(), eyre::Report> {
@@ -108,8 +112,27 @@ async fn main() -> Result<(), eyre::Report> {
         }
         ("run", Some(sub_matches)) => {
             let primary_key_file = sub_matches.value_of("primary-keys").unwrap();
-            let primary_keypair = KeyPair::import(primary_key_file)
-                .context("Failed to load the node's primary keypair")?;
+            // Try to load as PrimaryKeyConfig first (with uds_block_path), fallback to KeyPair
+            let (primary_keypair, uds_block_path_from_keyfile) = match PrimaryKeyConfig::import(primary_key_file) {
+                Ok(key_config) => {
+                    let uds_path = key_config.uds_block_path.clone();
+                    info!("Loaded PrimaryKeyConfig, uds_block_path='{}'", uds_path);
+                    let kp = key_config.extract_keypair()
+                        .context("Failed to extract KeyPair from PrimaryKeyConfig")?;
+                    if !uds_path.trim().is_empty() {
+                        info!("Loaded uds_block_path from primary-key file: '{}'", uds_path);
+                    } else {
+                        info!("PrimaryKeyConfig loaded but uds_block_path is empty");
+                    }
+                    (kp, Some(uds_path))
+                }
+                Err(_) => {
+                    // Fallback to standard KeyPair format
+                    let kp = KeyPair::import(primary_key_file)
+                        .context("Failed to load the node's primary keypair")?;
+                    (kp, None)
+                }
+            };
             let primary_network_key_file = sub_matches.value_of("primary-network-keys").unwrap();
             let primary_network_keypair = NetworkKeyPair::import(primary_network_key_file)
                 .context("Failed to load the node's primary network keypair")?;
@@ -145,6 +168,7 @@ async fn main() -> Result<(), eyre::Report> {
                 primary_network_keypair,
                 worker_keypair,
                 registry,
+                uds_block_path_from_keyfile,
             )
             .await?
         }
@@ -181,7 +205,7 @@ fn setup_benchmark_telemetry(
     tracing_level: &str,
     network_tracing_level: &str,
 ) -> Result<(), eyre::Report> {
-    let custom_directive = "executor::core=info";
+    let custom_directive = "executor::core=info,narwhal_consensus=info,consensus=info,narwhal_worker=info,narwhal_primary=info";
     let filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .parse(format!(
@@ -207,6 +231,7 @@ async fn run(
     primary_network_keypair: NetworkKeyPair,
     worker_keypair: NetworkKeyPair,
     registry: Registry,
+    uds_block_path_from_keyfile: Option<String>,
 ) -> Result<(), eyre::Report> {
     let committee_file = matches.value_of("committee").unwrap();
     let workers_file = matches.value_of("workers").unwrap();
@@ -222,12 +247,21 @@ async fn run(
     ));
 
     // Load default parameters if none are specified.
-    let parameters = match parameters_file {
+    let mut parameters = match parameters_file {
         Some(filename) => {
             Parameters::import(filename).context("Failed to load the node's parameters")?
         }
         None => Parameters::default(),
     };
+
+    // Set uds_block_path from primary-key file if present
+    if let Some(uds_path) = uds_block_path_from_keyfile {
+        if !uds_path.trim().is_empty() {
+            info!("Loaded uds_block_path from primary-key file: '{}'", uds_path);
+            parameters.uds_block_path = uds_path;
+        }
+    }
+    info!("Final uds_block_path value: '{}'", parameters.uds_block_path);
 
     // Make the data store.
     let store = NodeStorage::reopen(store_path);
@@ -240,19 +274,44 @@ async fn run(
     let node_handles = match matches.subcommand() {
         // Spawn the primary and consensus core.
         ("primary", Some(sub_matches)) => {
-            Node::spawn_primary(
-                primary_keypair,
-                primary_network_keypair,
-                committee,
-                worker_cache,
-                &store,
-                parameters.clone(),
-                /* consensus */ !sub_matches.is_present("consensus-disabled"),
-                /* execution_state */
-                Arc::new(SimpleExecutionState::new(tx_transaction_confirmation)),
-                &registry,
-            )
-            .await?
+            // Determine execution state: use UdsExecutionState if uds_block_path is set
+            if !parameters.uds_block_path.trim().is_empty() {
+                let epoch = (**committee.load()).epoch;
+                info!("Using UdsExecutionState with UDS path: {}", parameters.uds_block_path);
+                let uds_state = Arc::new(UdsExecutionState::new(
+                    parameters.uds_block_path.clone(),
+                    epoch,
+                    100, // empty_block_timeout_ms: 100ms - send empty blocks if no transactions for this duration
+                ));
+                
+                Node::spawn_primary(
+                    primary_keypair,
+                    primary_network_keypair,
+                    committee.clone(),
+                    worker_cache,
+                    &store,
+                    parameters.clone(),
+                    /* consensus */ !sub_matches.is_present("consensus-disabled"),
+                    /* execution_state */
+                    uds_state,
+                    &registry,
+                )
+                .await?
+            } else {
+                Node::spawn_primary(
+                    primary_keypair,
+                    primary_network_keypair,
+                    committee.clone(),
+                    worker_cache,
+                    &store,
+                    parameters.clone(),
+                    /* consensus */ !sub_matches.is_present("consensus-disabled"),
+                    /* execution_state */
+                    Arc::new(SimpleExecutionState::new(tx_transaction_confirmation)),
+                    &registry,
+                )
+                .await?
+            }
         }
 
         // Spawn a single worker.
@@ -286,7 +345,7 @@ async fn run(
     let _metrics_server_handle = start_prometheus_server(prom_address, &registry);
 
     // Analyze the consensus' output.
-    analyze(rx_transaction_confirmation).await;
+    analyze_u64(rx_transaction_confirmation).await;
 
     // Await on the completion handles of all the nodes we have launched
     join_all(node_handles).await;
@@ -297,6 +356,13 @@ async fn run(
 
 /// Receives an ordered list of certificates and apply any application-specific logic.
 async fn analyze(mut rx_output: Receiver<SerializedTransaction>) {
+    while let Some(_message) = rx_output.recv().await {
+        // NOTE: Notify the user that its transaction has been processed.
+    }
+}
+
+/// Receives u64 transaction confirmations (for SimpleExecutionState)
+async fn analyze_u64(mut rx_output: tokio::sync::mpsc::Receiver<u64>) {
     while let Some(_message) = rx_output.recv().await {
         // NOTE: Notify the user that its transaction has been processed.
     }

@@ -19,6 +19,10 @@ use types::{
     Batch, ReconfigureNotification, Transaction,
 };
 
+// Dependencies để tính transaction hash (fallback)
+use prost::Message;
+use hex;
+
 #[cfg(test)]
 #[path = "tests/batch_maker_tests.rs"]
 pub mod batch_maker_tests;
@@ -82,6 +86,74 @@ impl BatchMaker {
             tokio::select! {
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
+                    // CRITICAL FIX: Parse và tính hash đúng theo proto (giống worker.rs - parse trực tiếp trước)
+                    // transaction có thể là:
+                    // 1. Transactions protobuf (wrapper chứa nhiều transactions) - KHÔNG có prefix
+                    // 2. Single Transaction protobuf - KHÔNG có prefix
+                    // 3. Raw bytes với 8-byte length prefix (fallback)
+                    //
+                    // Logic: Thử parse TRỰC TIẾP trước (giống worker.rs), nếu không được mới cắt prefix
+                    // Đảm bảo hash khớp với worker.rs và Go (tính từ TransactionHashData protobuf)
+                    
+                    // Thử 1: Parse TRỰC TIẾP như Transactions (giống worker.rs - không có prefix)
+                    let tx_hash_hex = if let Ok(txs) = crate::transaction_logger::transaction::Transactions::decode(transaction.as_slice()) {
+                        // Parse thành công như Transactions - lấy transaction đầu tiên để log
+                        if let Some(tx) = txs.transactions.first() {
+                            // CRITICAL: Sử dụng calculate_transaction_hash() - tính từ TransactionHashData (protobuf encoded)
+                            // Đảm bảo hash khớp với Go và [TX RECEIVED]
+                            let tx_hash = crate::transaction_logger::calculate_transaction_hash(tx);
+                            hex::encode(&tx_hash) // Full 32 bytes hash (64 hex chars)
+                        } else {
+                            // Nếu không có transaction trong Transactions, fallback
+                            use sha3::{Digest as Sha3Digest, Keccak256};
+                            let tx_hash = Keccak256::digest(transaction.as_slice()).to_vec();
+                            hex::encode(&tx_hash) // Full 32 bytes hash
+                        }
+                    } 
+                    // Thử 2: Parse TRỰC TIẾP như single Transaction (giống worker.rs - không có prefix)
+                    else if let Ok(tx) = crate::transaction_logger::transaction::Transaction::decode(transaction.as_slice()) {
+                        // CRITICAL: Sử dụng calculate_transaction_hash() - tính từ TransactionHashData (protobuf encoded)
+                        // Đảm bảo hash khớp với Go và [TX RECEIVED]
+                        let tx_hash = crate::transaction_logger::calculate_transaction_hash(&tx);
+                        hex::encode(&tx_hash) // Full 32 bytes hash (64 hex chars)
+                    }
+                    // Thử 3: Strip 8-byte prefix và parse (fallback - giống batch_maker.rs cũ)
+                    else {
+                        const LENGTH_PREFIX_SIZE: usize = 8;
+                        let payload = if transaction.len() > LENGTH_PREFIX_SIZE {
+                            &transaction[LENGTH_PREFIX_SIZE..]
+                        } else {
+                            transaction.as_slice()
+                        };
+                        
+                        if let Ok(txs) = crate::transaction_logger::transaction::Transactions::decode(payload) {
+                            if let Some(tx) = txs.transactions.first() {
+                                let tx_hash = crate::transaction_logger::calculate_transaction_hash(tx);
+                                hex::encode(&tx_hash)
+                            } else {
+                                use sha3::{Digest as Sha3Digest, Keccak256};
+                                let tx_hash = Keccak256::digest(payload).to_vec();
+                                hex::encode(&tx_hash)
+                            }
+                        } else if let Ok(tx) = crate::transaction_logger::transaction::Transaction::decode(payload) {
+                            let tx_hash = crate::transaction_logger::calculate_transaction_hash(&tx);
+                            hex::encode(&tx_hash)
+                        } else {
+                            // Fallback: tính hash từ raw bytes bằng Keccak256
+                            use sha3::{Digest as Sha3Digest, Keccak256};
+                            let tx_hash = Keccak256::digest(payload).to_vec();
+                            hex::encode(&tx_hash) // Full 32 bytes hash
+                        }
+                    };
+                    
+                    tracing::info!(
+                        target: "narwhal_audit",
+                        "[WORKER TX RECEIVED] Worker received transaction: TxHash={}, Size={} bytes, CurrentBatchSize={} bytes",
+                        tx_hash_hex,
+                        transaction.len(),
+                        self.current_batch_size
+                    );
+                    
                     self.current_batch_size += transaction.len();
                     self.current_batch.0.push(transaction);
                     if self.current_batch_size >= self.batch_size {
@@ -128,6 +200,84 @@ impl BatchMaker {
         // Serialize the batch.
         self.current_batch_size = 0;
         let batch: Batch = Batch(self.current_batch.0.drain(..).collect());
+        
+        // Log transaction hashes trong batch khi seal
+        if !batch.0.is_empty() {
+            use fastcrypto::hash::Hash;
+            let batch_digest = batch.digest();
+            tracing::info!(
+                target: "narwhal_audit",
+                "[WORKER BATCH SEAL] Sealing batch: BatchDigest={}, TxCount={}, TotalSize={} bytes, Timeout={}",
+                batch_digest,
+                batch.0.len(),
+                size,
+                timeout
+            );
+            
+            // Log từng transaction hash trong batch
+            // CRITICAL FIX: Parse và tính hash đúng theo proto (giống worker.rs - parse trực tiếp trước)
+            // Logic: Thử parse TRỰC TIẾP trước, nếu không được mới cắt prefix (fallback)
+            for (idx, tx_bytes) in batch.0.iter().enumerate() {
+                // Thử 1: Parse TRỰC TIẾP như Transactions (giống worker.rs - không có prefix)
+                let tx_hash_hex = if let Ok(txs) = crate::transaction_logger::transaction::Transactions::decode(tx_bytes.as_slice()) {
+                    // Parse thành công như Transactions - log tất cả transactions
+                    if let Some(tx) = txs.transactions.first() {
+                        // CRITICAL: Sử dụng calculate_transaction_hash() - tính từ TransactionHashData (protobuf encoded)
+                        // Đảm bảo hash khớp với Go và [TX RECEIVED]
+                        let tx_hash = crate::transaction_logger::calculate_transaction_hash(tx);
+                        hex::encode(&tx_hash) // Full 32 bytes hash (64 hex chars)
+                    } else {
+                        // Nếu không có transaction trong Transactions, fallback
+                        use sha3::{Digest as Sha3Digest, Keccak256};
+                        let tx_hash = Keccak256::digest(tx_bytes.as_slice()).to_vec();
+                        hex::encode(&tx_hash)
+                    }
+                } 
+                // Thử 2: Parse TRỰC TIẾP như single Transaction (giống worker.rs - không có prefix)
+                else if let Ok(tx) = crate::transaction_logger::transaction::Transaction::decode(tx_bytes.as_slice()) {
+                    // CRITICAL: Sử dụng calculate_transaction_hash() - tính từ TransactionHashData (protobuf encoded)
+                    let tx_hash = crate::transaction_logger::calculate_transaction_hash(&tx);
+                    hex::encode(&tx_hash) // Full 32 bytes hash (64 hex chars)
+                }
+                // Thử 3: Strip 8-byte prefix và parse (fallback)
+                else {
+                    const LENGTH_PREFIX_SIZE: usize = 8;
+                    let payload = if tx_bytes.len() > LENGTH_PREFIX_SIZE {
+                        &tx_bytes[LENGTH_PREFIX_SIZE..]
+                    } else {
+                        tx_bytes
+                    };
+                    
+                    if let Ok(txs) = crate::transaction_logger::transaction::Transactions::decode(payload) {
+                        if let Some(tx) = txs.transactions.first() {
+                            let tx_hash = crate::transaction_logger::calculate_transaction_hash(tx);
+                            hex::encode(&tx_hash)
+                        } else {
+                            use sha3::{Digest as Sha3Digest, Keccak256};
+                            let tx_hash = Keccak256::digest(payload).to_vec();
+                            hex::encode(&tx_hash)
+                        }
+                    } else if let Ok(tx) = crate::transaction_logger::transaction::Transaction::decode(payload) {
+                        let tx_hash = crate::transaction_logger::calculate_transaction_hash(&tx);
+                        hex::encode(&tx_hash)
+                    } else {
+                        // Fallback: tính hash từ raw bytes
+                        use sha3::{Digest as Sha3Digest, Keccak256};
+                        let tx_hash = Keccak256::digest(payload).to_vec();
+                        hex::encode(&tx_hash)
+                    }
+                };
+                
+                tracing::info!(
+                    target: "narwhal_audit",
+                    "[WORKER BATCH TX] Batch {} Tx[{}]: TxHash={}, Size={} bytes",
+                    batch_digest,
+                    idx,
+                    tx_hash_hex,
+                    tx_bytes.len()
+                );
+            }
+        }
 
         #[cfg(feature = "benchmark")]
         {

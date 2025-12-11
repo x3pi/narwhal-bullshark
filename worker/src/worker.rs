@@ -25,7 +25,9 @@ use store::Store;
 use tokio::{sync::watch, task::JoinHandle};
 use tonic::{Request, Response, Status};
 use tower::ServiceBuilder;
-use tracing::info;
+use tracing::{info, warn};
+use hex;
+use prost::Message;
 use types::{
     error::DagError,
     metered_channel::{channel, Receiver, Sender},
@@ -422,9 +424,75 @@ impl Transactions for TxReceiverHandler {
         request: Request<TransactionProto>,
     ) -> Result<Response<Empty>, Status> {
         let message = request.into_inner().transaction;
+        let tx_bytes = message.to_vec();
+        
+        // CRITICAL: Parse và tính hash đúng theo proto (giống batch_maker.rs)
+        // Transaction có thể là Transactions protobuf (nhiều transactions) hoặc single Transaction
+        let tx_hex_full = hex::encode(&tx_bytes);
+        
+        // Thử parse như Transactions trước (wrapper chứa nhiều transactions)
+        if let Ok(txs) = crate::transaction_logger::transaction::Transactions::decode(tx_bytes.as_slice()) {
+            // Parse thành công như Transactions - log TẤT CẢ transactions
+            if txs.transactions.is_empty() {
+                warn!(
+                    "[WORKER RX] Received Transactions but contains no transactions. TxHex={}, Size={} bytes",
+                    tx_hex_full,
+                    tx_bytes.len()
+                );
+            } else {
+                for (idx, tx) in txs.transactions.iter().enumerate() {
+                    // CRITICAL: Sử dụng calculate_transaction_hash() - tính từ TransactionHashData (protobuf encoded)
+                    let tx_hash = crate::transaction_logger::calculate_transaction_hash(tx);
+                    let tx_hash_hex = hex::encode(&tx_hash);
+                    
+                    if txs.transactions.len() > 1 {
+                        info!(
+                            "[WORKER RX] Received transaction [{}/{}] in Transactions: TxHash={}, TxHex={}, Size={} bytes",
+                            idx + 1,
+                            txs.transactions.len(),
+                            tx_hash_hex,
+                            tx_hex_full,
+                            tx_bytes.len()
+                        );
+                    } else {
+                        info!(
+                            "[WORKER RX] Received single transaction in Transactions: TxHash={}, TxHex={}, Size={} bytes",
+                            tx_hash_hex,
+                            tx_hex_full,
+                            tx_bytes.len()
+                        );
+                    }
+                }
+            }
+        } else if let Ok(tx) = crate::transaction_logger::transaction::Transaction::decode(tx_bytes.as_slice()) {
+            // Parse thành công như single Transaction
+            // CRITICAL: Sử dụng calculate_transaction_hash() - tính từ TransactionHashData (protobuf encoded)
+            let tx_hash = crate::transaction_logger::calculate_transaction_hash(&tx);
+            let tx_hash_hex = hex::encode(&tx_hash);
+            
+            info!(
+                "[WORKER RX] Received single Transaction: TxHash={}, TxHex={}, Size={} bytes",
+                tx_hash_hex,
+                tx_hex_full,
+                tx_bytes.len()
+            );
+        } else {
+            // Fallback: không parse được protobuf, tính hash từ raw bytes
+            use sha3::{Digest, Keccak256};
+            let tx_hash = Keccak256::digest(&tx_bytes).to_vec();
+            let tx_hash_hex = hex::encode(&tx_hash);
+            
+            warn!(
+                "[WORKER RX] Failed to parse transaction as Transactions or Transaction. Using raw bytes hash: TxHash={}, TxHex={}, Size={} bytes",
+                tx_hash_hex,
+                tx_hex_full,
+                tx_bytes.len()
+            );
+        }
+        
         // Send the transaction to the batch maker.
         self.tx_batch_maker
-            .send(message.to_vec())
+            .send(tx_bytes)
             .await
             .map_err(|_| DagError::ShuttingDown)
             .map_err(|e| Status::not_found(e.to_string()))?;
@@ -437,14 +505,91 @@ impl Transactions for TxReceiverHandler {
         request: tonic::Request<tonic::Streaming<types::TransactionProto>>,
     ) -> Result<tonic::Response<types::Empty>, tonic::Status> {
         let mut transactions = request.into_inner();
+        let mut tx_count = 0;
 
         while let Some(Ok(txn)) = transactions.next().await {
+            let tx_bytes = txn.transaction.to_vec();
+            tx_count += 1;
+            let tx_hex_full = hex::encode(&tx_bytes);
+            
+            // CRITICAL: Parse và tính hash đúng theo proto (giống batch_maker.rs)
+            // Thử parse như Transactions trước (wrapper chứa nhiều transactions)
+            if let Ok(txs) = crate::transaction_logger::transaction::Transactions::decode(tx_bytes.as_slice()) {
+                // Parse thành công như Transactions - log TẤT CẢ transactions
+                if txs.transactions.is_empty() {
+                    warn!(
+                        "[WORKER RX STREAM] Received Transactions [{}] but contains no transactions. TxHex={}, Size={} bytes",
+                        tx_count,
+                        tx_hex_full,
+                        tx_bytes.len()
+                    );
+                } else {
+                    for (idx, tx) in txs.transactions.iter().enumerate() {
+                        // CRITICAL: Sử dụng calculate_transaction_hash() - tính từ TransactionHashData (protobuf encoded)
+                        let tx_hash = crate::transaction_logger::calculate_transaction_hash(tx);
+                        let tx_hash_hex = hex::encode(&tx_hash);
+                        
+                        if txs.transactions.len() > 1 {
+                            info!(
+                                "[WORKER RX STREAM] Received transaction [{}/{}] in Transactions [Stream#{}]: TxHash={}, TxHex={}, Size={} bytes",
+                                idx + 1,
+                                txs.transactions.len(),
+                                tx_count,
+                                tx_hash_hex,
+                                tx_hex_full,
+                                tx_bytes.len()
+                            );
+                        } else {
+                            info!(
+                                "[WORKER RX STREAM] Received single transaction in Transactions [Stream#{}]: TxHash={}, TxHex={}, Size={} bytes",
+                                tx_count,
+                                tx_hash_hex,
+                                tx_hex_full,
+                                tx_bytes.len()
+                            );
+                        }
+                    }
+                }
+            } else if let Ok(tx) = crate::transaction_logger::transaction::Transaction::decode(tx_bytes.as_slice()) {
+                // Parse thành công như single Transaction
+                // CRITICAL: Sử dụng calculate_transaction_hash() - tính từ TransactionHashData (protobuf encoded)
+                let tx_hash = crate::transaction_logger::calculate_transaction_hash(&tx);
+                let tx_hash_hex = hex::encode(&tx_hash);
+                
+                info!(
+                    "[WORKER RX STREAM] Received single Transaction [Stream#{}]: TxHash={}, TxHex={}, Size={} bytes",
+                    tx_count,
+                    tx_hash_hex,
+                    tx_hex_full,
+                    tx_bytes.len()
+                );
+            } else {
+                // Fallback: không parse được protobuf, tính hash từ raw bytes
+                use sha3::{Digest, Keccak256};
+                let tx_hash = Keccak256::digest(&tx_bytes).to_vec();
+                let tx_hash_hex = hex::encode(&tx_hash);
+                
+                warn!(
+                    "[WORKER RX STREAM] Failed to parse transaction [Stream#{}] as Transactions or Transaction. Using raw bytes hash: TxHash={}, TxHex={}, Size={} bytes",
+                    tx_count,
+                    tx_hash_hex,
+                    tx_hex_full,
+                    tx_bytes.len()
+                );
+            }
+            
             // Send the transaction to the batch maker.
             self.tx_batch_maker
-                .send(txn.transaction.to_vec())
+                .send(tx_bytes)
                 .await
                 .expect("Failed to send transaction");
         }
+        
+        info!(
+            "[WORKER RX STREAM] Stream completed: TotalTransactions={}",
+            tx_count
+        );
+        
         Ok(Response::new(Empty {}))
     }
 }

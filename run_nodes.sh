@@ -11,7 +11,16 @@ NODES=$(jq '.authorities | length' < benchmark/.committee.json)
 
 # --- Đường dẫn ---
 BENCHMARK_DIR="benchmark"
-NODE_BINARY="./target/release/node"
+# Kiểm tra xem có binary release không, nếu không thì dùng debug
+if [ -f "./target/release/node" ]; then
+    NODE_BINARY="./target/release/node"
+elif [ -f "./target/debug/node" ]; then
+    NODE_BINARY="./target/debug/node"
+    echo "⚠️  Warning: Using debug binary (release not found). Run './build.sh release' for optimized build."
+else
+    echo "❌ Error: Node binary not found! Please run './build.sh' first."
+    exit 1
+fi
 
 LOG_DIR="$BENCHMARK_DIR/logs"
 COMMITTEE_FILE="$BENCHMARK_DIR/.committee.json"
@@ -62,9 +71,12 @@ for i in $(seq 0 $((NODES-1))); do
     primary_cmd="$NODE_BINARY -vv run --primary-keys '$primary_key_file' --primary-network-keys '$primary_network_key_file' --worker-keys '$worker_key_file' --committee '$COMMITTEE_FILE' --workers '$WORKERS_FILE' --store '$primary_db_path' --parameters '$PARAMETERS_FILE' primary"
     
     # LOG LEVEL: info để thấy transaction logs, warn cho các lỗi
+    # Thêm node=info để hiển thị log từ module node (bao gồm uds_block_path)
+    # Thêm narwhal_consensus=info để hiển thị log commit
+    # Sử dụng stdbuf để disable buffering và đảm bảo log được ghi ngay lập tức
     # Kiểm tra và xóa session cũ nếu tồn tại
     tmux kill-session -t "primary-$i" 2>/dev/null || true
-    tmux new -d -s "primary-$i" "RUST_LOG=info,narwhal_audit=info $primary_cmd > '$primary_log_file' 2>&1"
+    tmux new -d -s "primary-$i" "RUST_LOG=info,node=info,narwhal_audit=info,narwhal_consensus=info,consensus=info stdbuf -oL -eL $primary_cmd > '$primary_log_file' 2>&1"
     
     # --- Khởi chạy tất cả Workers cho node này ---
     for j in $(seq 0 $((WORKERS_PER_NODE-1))); do
@@ -77,9 +89,12 @@ for i in $(seq 0 $((NODES-1))); do
         worker_cmd="$NODE_BINARY -vv run --primary-keys '$primary_key_file' --primary-network-keys '$primary_network_key_file' --worker-keys '$worker_key_file' --committee '$COMMITTEE_FILE' --workers '$WORKERS_FILE' --store '$worker_db_path' --parameters '$PARAMETERS_FILE' worker --id $j"
         
         # LOG LEVEL: info để thấy transaction logs, warn cho các lỗi
+        # Thêm node=info để hiển thị log từ module node
+        # Thêm narwhal_consensus=info để hiển thị log commit
+        # Sử dụng stdbuf để disable buffering và đảm bảo log được ghi ngay lập tức
         # Kiểm tra và xóa session cũ nếu tồn tại
         tmux kill-session -t "worker-$i-$j" 2>/dev/null || true
-        tmux new -d -s "worker-$i-$j" "RUST_LOG=info,narwhal_audit=info $worker_cmd > '$worker_log_file' 2>&1"
+        tmux new -d -s "worker-$i-$j" "RUST_LOG=info,node=info,narwhal_audit=info,narwhal_consensus=info,consensus=info stdbuf -oL -eL $worker_cmd > '$worker_log_file' 2>&1"
     done
 done
 

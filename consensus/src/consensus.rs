@@ -7,7 +7,7 @@
 use crate::{metrics::ConsensusMetrics, ConsensusOutput, SequenceNumber};
 use config::Committee;
 use crypto::PublicKey;
-use fastcrypto::hash::Hash;
+use fastcrypto::{hash::Hash, traits::EncodeDecodeBase64};
 use std::{
     cmp::{max, Ordering},
     collections::HashMap,
@@ -130,6 +130,9 @@ impl ConsensusState {
 
     /// Update and clean up internal state base on committed certificates.
     pub fn update(&mut self, certificate: &Certificate, gc_depth: Round) {
+        let cert_round = certificate.round();
+        let old_last_committed = self.last_committed_round;
+        
         self.last_committed
             .entry(certificate.origin())
             .and_modify(|r| *r = max(*r, certificate.round()))
@@ -294,25 +297,40 @@ where
                     }
 
                     // Process the certificate using the selected consensus protocol.
+                    let cert_round = certificate.round();
                     let sequence =
                         self.protocol
                             .process_certificate(&mut state, self.consensus_index, certificate)?;
 
                     // Update the consensus index.
+                    let old_consensus_index = self.consensus_index;
                     self.consensus_index += sequence.len() as u64;
+                    
+                    // Log khi có certificates được commit (ẩn để giảm log)
+                    if !sequence.is_empty() {
+                        tracing::debug!("📊 [Consensus] Round {} processed: {} certificate(s) committed, ConsensusIndex {} -> {} (LastCommittedRound: {})", 
+                            cert_round, sequence.len(), old_consensus_index, self.consensus_index, state.last_committed_round);
+                    }
 
                     // Output the sequence in the right order.
                     for output in sequence {
                         let certificate = &output.certificate;
+                        
                         #[cfg(not(feature = "benchmark"))]
                         if output.consensus_index % 5_000 == 0 {
                             tracing::debug!("Committed {}", certificate.header);
                         }
 
                         #[cfg(feature = "benchmark")]
-                        for digest in certificate.header.payload.keys() {
+                        {
                             // NOTE: This log entry is used to compute performance.
-                            tracing::info!("Committed {} -> {:?}", certificate.header, digest);
+                            // Chỉ log khi có payload (có giao dịch)
+                            let payload_digests: Vec<_> = certificate.header.payload.keys().collect();
+                            if !payload_digests.is_empty() {
+                                for digest in payload_digests {
+                                    tracing::info!("Committed {} -> {:?}", certificate.header, digest);
+                                }
+                            }
                         }
 
                         // Update DAG size metric periodically to limit computation cost.

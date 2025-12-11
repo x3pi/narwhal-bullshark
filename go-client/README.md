@@ -68,5 +68,7 @@ Từ file `.workers.json`, bạn có thể gửi tới worker 0 như sau:
 
 # Worker 0 của authority thứ hai
 ./single_transaction_client --addr /ip4/127.0.0.1/tcp/3013/http
+
+./single_transaction_client --addr http://127.0.0.1:3015 --size 256
 ```
 

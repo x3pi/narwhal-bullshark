@@ -154,6 +154,18 @@ impl Primary {
         );
         let (tx_state_handler, rx_state_handler) =
             channel(CHANNEL_CAPACITY, &primary_channel_metrics.tx_state_handler);
+        // FORK-SAFE: Channel to notify Proposer about certified headers
+        // Reuse tx_headers metrics since it's proposer-related communication
+        let (tx_proposer_certified, rx_proposer_certified) = channel(
+            CHANNEL_CAPACITY,
+            &primary_channel_metrics.tx_headers,
+        );
+        // FORK-SAFE: Channel to notify Proposer about sequenced certificates
+        // Reuse tx_headers metrics since it's proposer-related communication
+        let (tx_proposer_sequenced, rx_proposer_sequenced) = channel(
+            CHANNEL_CAPACITY,
+            &primary_channel_metrics.tx_headers,
+        );
 
         // we need to hack the gauge from this consensus channel into the primary registry
         // This avoids a cyclic dependency in the initialization of consensus and primary
@@ -301,9 +313,9 @@ impl Primary {
             tx_consensus,
             /* tx_proposer */ tx_parents,
             node_metrics.clone(),
+            /* tx_proposer_certified */ tx_proposer_certified.clone(),
             core_primary_network,
         );
-
         // Receives batch digests from other workers. They are only used to validate headers.
         let payload_receiver_handle = PayloadReceiver::spawn(
             payload_store.clone(),
@@ -417,6 +429,9 @@ impl Primary {
             /* rx_workers */ rx_our_digests,
             /* tx_core */ tx_headers,
             node_metrics,
+            parameters.gc_depth,
+            /* rx_sequenced */ rx_proposer_sequenced,
+            /* rx_certified */ rx_proposer_certified,
         );
 
         // The `Helper` is dedicated to reply to certificates & payload availability requests
@@ -442,6 +457,7 @@ impl Primary {
             rx_state_handler,
             tx_reconfigure,
             P2pNetwork::new(network),
+            tx_proposer_sequenced,
         );
 
         let consensus_api_handle = if !internal_consensus {

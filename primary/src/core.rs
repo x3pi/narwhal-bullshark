@@ -66,6 +66,9 @@ pub struct Core {
     tx_consensus: Sender<Certificate>,
     /// Send valid a quorum of certificates' ids to the `Proposer` (along with their round).
     tx_proposer: Sender<(Vec<Certificate>, Round, Epoch)>,
+    /// FORK-SAFE: Notify Proposer when a header gets certified (quorum achieved).
+    /// This allows Proposer to track InFlight batches from certified headers.
+    tx_proposer_certified: Sender<Header>,
 
     /// The last garbage collected round.
     gc_round: Round,
@@ -109,6 +112,7 @@ impl Core {
         tx_consensus: Sender<Certificate>,
         tx_proposer: Sender<(Vec<Certificate>, Round, Epoch)>,
         metrics: Arc<PrimaryMetrics>,
+        tx_proposer_certified: Sender<Header>,
         primary_network: P2pNetwork,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
@@ -129,6 +133,7 @@ impl Core {
                 rx_proposer,
                 tx_consensus,
                 tx_proposer,
+                tx_proposer_certified,
                 gc_round: 0,
                 processing: HashMap::with_capacity(2 * gc_depth as usize),
                 current_header: Header::default(),
@@ -364,6 +369,11 @@ impl Core {
                 .append(vote, &self.committee, &self.current_header)?
         {
             debug!("Assembled {:?}", certificate);
+
+                // FORK-SAFE: Notify Proposer that this header got certified (quorum achieved).
+                // All nodes see the same certified header → all nodes track the same batches → fork-safe.
+                // Ignore error if Proposer channel is closed (shutting down).
+                let _ = self.tx_proposer_certified.send(self.current_header.clone()).await;
 
             // Broadcast the certificate.
             let network_keys = self
@@ -630,9 +640,18 @@ impl Core {
                             }
                         },
                         PrimaryMessage::Certificate(certificate) => {
+                            // FORK-SAFE: Notify Proposer when a certificate from another node is received
+                            // (certificate means the header was certified). However, we only notify for
+                            // certificates we receive from network, not for certificates we create ourselves.
+                            // For our own certificates, notification happens in process_vote when quorum is reached.
+                            // Note: This certificate's header was already certified (that's why it's a certificate),
+                            // so we should track its batches as InFlight.
+                            // Ignore error if channel is closed.
+                            let _ = self.tx_proposer_certified.send(certificate.header.clone()).await;
+                            
                             match self.sanitize_certificate(&certificate).await {
-                                Ok(()) =>  self.process_certificate(certificate).await,
-                                error => error
+                                Ok(()) => self.process_certificate(certificate).await,
+                                error => error,
                             }
                         },
                         _ => panic!("Unexpected core message")

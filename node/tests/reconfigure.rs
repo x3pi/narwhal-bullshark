@@ -340,6 +340,7 @@ async fn epoch_change() {
             /* consensus */ true,
             execution_state,
             &Registry::new(),
+            None, // tx_certificate_output: không cần forward Certificate trong test
         )
         .await
         .unwrap();

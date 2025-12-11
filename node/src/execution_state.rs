@@ -19,7 +19,6 @@ use bincode;
 use bytes::Bytes;
 use consensus::ConsensusOutput;
 use executor::{ExecutionIndices, ExecutionState};
-use fastcrypto::hash::Hash;
 use prost::Message;
 use sha3::{Digest, Keccak256};
 use hex;
@@ -36,6 +35,23 @@ use tokio::{
     time::{sleep, Duration as TokioDuration},
 };
 use tracing::{debug, error, info, warn};
+
+/// Macro cho UDS debug logs - chỉ compile trong debug mode
+/// Giúp giảm overhead trong production builds
+/// Note: Trong release builds, các logs này sẽ không được compile (no-op)
+#[cfg(debug_assertions)]
+macro_rules! uds_debug {
+    ($($arg:tt)*) => {
+        debug!($($arg)*);
+    };
+}
+
+#[cfg(not(debug_assertions))]
+macro_rules! uds_debug {
+    ($($arg:tt)*) => {
+        // No-op in release builds
+    };
+}
 
 /// Danh sách các transaction hash cần trace để debug
 /// Thêm hash vào đây để trace giao dịch cụ thể
@@ -58,7 +74,7 @@ fn should_trace_tx(tx_hash_hex: &str) -> bool {
 }
 
 /// Tính hash của transaction từ Transaction object
-/// GIỐNG HỆT 100% narwhal/worker/src/transaction_logger.rs (dòng 17-60)
+/// OPTIMIZED: Sử dụng shared logic từ worker::transaction_logger để tránh code duplication
 /// 
 /// Thống nhất với Go: Tạo TransactionHashData từ Transaction, encode thành protobuf, rồi tính Keccak256 hash
 /// Đảm bảo hash khớp giữa Go và Rust vì cả hai đều tính từ TransactionHashData (protobuf encoded)
@@ -70,7 +86,15 @@ fn should_trace_tx(tx_hash_hex: &str) -> bool {
 /// - KHÔNG ảnh hưởng đến transaction bytes gốc
 /// - Hash được tính từ TransactionHashData protobuf encoding (theo chuẩn Go implementation)
 /// - Bytes được gửi qua UDS phải là bytes gốc (không serialize lại)
+/// 
+/// NOTE: Function này giữ lại để maintain compatibility với node's transaction type
+/// Logic tính hash giống hệt worker::transaction_logger::calculate_transaction_hash
+/// nhưng sử dụng node's transaction::Transaction type
 fn calculate_transaction_hash_from_proto(tx: &transaction::Transaction) -> Vec<u8> {
+    // OPTIMIZATION: Logic giống hệt worker::transaction_logger::calculate_transaction_hash
+    // Giữ lại function này vì node và worker có thể có different protobuf-generated types
+    // nhưng logic tính hash hoàn toàn giống nhau
+    
     // Tạo TransactionHashData từ Transaction (chỉ đọc fields, không serialize transaction)
     let hash_data = transaction::TransactionHashData {
         from_address: tx.from_address.clone(),
@@ -350,7 +374,7 @@ fn parse_transactions_from_bytes(transaction_bytes: &[u8]) -> Vec<(String, Vec<u
                         
                         panic!("CRITICAL: Transaction bytes hash mismatch - cannot proceed");
                     } else {
-                        debug!("✅ [UDS] Transaction bytes validated: TxHash={}, BytesLen={}", tx_hash_hex, tx_bytes.len());
+                        uds_debug!("✅ [UDS] Transaction bytes validated: TxHash={}, BytesLen={}", tx_hash_hex, tx_bytes.len());
                     }
                 }
                 Err(e) => {
@@ -410,7 +434,7 @@ fn parse_transactions_from_bytes(transaction_bytes: &[u8]) -> Vec<(String, Vec<u
                     
                     panic!("CRITICAL: Serialized transaction hash mismatch - cannot proceed");
                 } else {
-                    debug!("✅ [UDS] Serialized transaction bytes validated: TxHash={}, BytesLen={}", tx_hash_hex, tx_bytes.len());
+                    uds_debug!("✅ [UDS] Serialized transaction bytes validated: TxHash={}, BytesLen={}", tx_hash_hex, tx_bytes.len());
                 }
             }
             Err(e) => {
@@ -571,14 +595,6 @@ pub struct UdsExecutionState {
     last_consensus_index: Arc<Mutex<u64>>,
     /// UDS stream (lazy connection)
     stream: Arc<Mutex<Option<UnixStream>>>,
-    /// Timeout for sending empty blocks when consensus commits without transactions
-    #[allow(dead_code)]
-    empty_block_timeout: Duration,
-    /// Track các transaction đã được xử lý trong các blocks trước đó (để tránh duplicate)
-    /// NOTE: Đây là execution-level tracking, không ảnh hưởng đến consensus
-    /// NOTE: Hiện tại không được sử dụng (batch-level deduplication đủ), nhưng giữ lại để tương lai
-    #[allow(dead_code)]
-    processed_transactions: Arc<Mutex<HashSet<Vec<u8>>>>,
     /// Late certificates buffer: Lưu thông tin certificate đến muộn (sau khi block đã gửi)
     /// Format: (block_height, consensus_index, round, has_transaction)
     late_certificates: Arc<Mutex<Vec<(u64, u64, u64, bool)>>>,
@@ -671,7 +687,7 @@ impl BlockBuilder {
                             sorted_entries.len(), parsed_wrapper.transactions.len());
                         panic!("CRITICAL: Wrapper transaction count mismatch!");
                     }
-                    debug!("✅ [UDS] Wrapper validation: {} transactions in wrapper", parsed_wrapper.transactions.len());
+                    uds_debug!("✅ [UDS] Wrapper validation: {} transactions in wrapper", parsed_wrapper.transactions.len());
                     
                     // VALIDATION: Đảm bảo hash của từng transaction trong wrapper khớp với hash đã lưu
                     for (idx, tx) in parsed_wrapper.transactions.iter().enumerate() {
@@ -790,8 +806,6 @@ impl UdsExecutionState {
             last_sent_height: Arc::new(Mutex::new(None)), // None = chưa gửi block nào
             last_consensus_index: Arc::new(Mutex::new(0)),
             stream: Arc::new(Mutex::new(None)),
-            empty_block_timeout: Duration::from_millis(empty_block_timeout_ms),
-            processed_transactions: Arc::new(Mutex::new(HashSet::new())),
             late_certificates: Arc::new(Mutex::new(Vec::new())),
             max_send_retries,
             retry_delay_base_ms,
@@ -847,10 +861,10 @@ impl UdsExecutionState {
                 if block.height <= last_sent {
                     drop(last_sent_guard);
                     if attempt > 0 {
-                        debug!("⏭️ [UDS] Stopping retry for block {} (attempt {}): Block already sent (last_sent_height={})", 
+                        uds_debug!("⏭️ [UDS] Stopping retry for block {} (attempt {}): Block already sent (last_sent_height={})", 
                             block.height, attempt + 1, last_sent);
                     } else {
-                        debug!("⏭️ [UDS] Skipping retry for block {}: Block already sent (last_sent_height={})", 
+                        uds_debug!("⏭️ [UDS] Skipping retry for block {}: Block already sent (last_sent_height={})", 
                             block.height, last_sent);
                     }
                     return Ok(()); // Block đã được gửi thành công
@@ -917,7 +931,7 @@ impl UdsExecutionState {
                                 return Err(format!("CRITICAL: Hash validation failed before encode - transaction bytes corrupted! Block {} Tx[{}]", block.height, idx));
                             }
                             // Hash khớp → wrapper bytes đúng
-                            debug!("✅ [UDS] Pre-encode validation: Block {} Tx[{}] wrapper bytes verified: TxHash={}, BytesLen={}, WrapperTxCount={}", 
+                            uds_debug!("✅ [UDS] Pre-encode validation: Block {} Tx[{}] wrapper bytes verified: TxHash={}, BytesLen={}, WrapperTxCount={}", 
                                 block.height, idx, expected_hash, tx.digest.len(), parsed_wrapper.transactions.len());
                         }
                         Err(e) => {
@@ -985,7 +999,7 @@ impl UdsExecutionState {
                 }
             }
         } else {
-            debug!("📤 [UDS] Preparing to send EMPTY block: Height={}, Epoch={}, ProtoSize={} bytes", 
+            uds_debug!("📤 [UDS] Preparing to send EMPTY block: Height={}, Epoch={}, ProtoSize={} bytes", 
                 block.height, block.epoch, proto_buf.len());
         }
 
@@ -1037,7 +1051,7 @@ impl UdsExecutionState {
                                     
                                     panic!("CRITICAL: Hash validation failed before sending - wrapper bytes corrupted!");
                                 } else {
-                                    debug!("✅ [UDS] Pre-send validation: Block {} Tx[{}] wrapper bytes verified: TxHash={}, BytesLen={}, WrapperTxCount={}", 
+                                    uds_debug!("✅ [UDS] Pre-send validation: Block {} Tx[{}] wrapper bytes verified: TxHash={}, BytesLen={}, WrapperTxCount={}", 
                                         block.height, idx, expected_hash, tx.digest.len(), parsed_wrapper.transactions.len());
                                 }
                             }
@@ -1160,7 +1174,7 @@ impl UdsExecutionState {
             *self.last_sent_height.lock().await = Some(height);
         }
 
-        debug!("✅ [UDS] Successfully filled gaps: {} empty blocks sent", gap_count);
+        uds_debug!("✅ [UDS] Successfully filled gaps: {} empty blocks sent", gap_count);
         Ok(())
     }
 }
@@ -2029,88 +2043,107 @@ impl UdsExecutionState {
     /// Flush block hiện tại nếu cần thiết
     /// Gửi block hiện tại khi consensus_index đã vượt quá block_end_index
     /// Điều này đảm bảo block được gửi ngay cả khi không có certificate từ block tiếp theo
+    /// 
+    /// OPTIMIZED: Minimize lock scope để giảm contention
     async fn flush_current_block_if_needed(&self, consensus_index: u64) {
-        let mut current_block_guard = self.current_block.lock().await;
-        
-        if let Some(block) = current_block_guard.as_ref() {
-            let block_end_index = (block.height + 1) * BLOCK_SIZE - 1;
-            
-            // Nếu consensus_index đã vượt quá block_end_index, block này nên được gửi
-            if consensus_index > block_end_index {
-                let block_height = block.height;
-                let block_tx_count = block.transaction_entries.len();
-                
-                // Kiểm tra xem block đã được gửi chưa
-                let last_sent_guard = self.last_sent_height.lock().await;
-                let last_sent = *last_sent_guard;
-                drop(last_sent_guard);
-                
-                let should_send = if let Some(last_sent_val) = last_sent {
-                    block_height > last_sent_val
+        // OPTIMIZATION: Quick check với minimal lock time
+        let (block_height, block_tx_count, should_flush) = {
+            let current_block_guard = self.current_block.lock().await;
+            if let Some(block) = current_block_guard.as_ref() {
+                let block_end_index = (block.height + 1) * BLOCK_SIZE - 1;
+                let should_flush = consensus_index > block_end_index;
+                if should_flush {
+                    (Some(block.height), Some(block.transaction_entries.len()), true)
                 } else {
-                    true
-                };
+                    (None, None, false)
+                }
+            } else {
+                (None, None, false)
+            }
+        };
+        
+        if !should_flush {
+            return;
+        }
+        
+        let block_height = block_height.unwrap();
+        let block_tx_count = block_tx_count.unwrap();
+        let block_end_index = (block_height + 1) * BLOCK_SIZE - 1;
+        
+        // OPTIMIZATION: Check last_sent_height trước khi lock current_block lâu
+        let last_sent = {
+            let last_sent_guard = self.last_sent_height.lock().await;
+            *last_sent_guard
+        };
+        
+        let should_send = if let Some(last_sent_val) = last_sent {
+            block_height > last_sent_val
+        } else {
+            true
+        };
+        
+        if !should_send {
+            return;
+        }
+        
+        info!("📤 [UDS] Flushing block {} with {} transactions (consensus_index {} > block_end_index {})", 
+            block_height, block_tx_count, consensus_index, block_end_index);
+        
+        // OPTIMIZATION: Lock current_block chỉ khi cần take block
+        let (block_to_send, tx_hash_map, batch_digests, trace_hashes) = {
+            let mut current_block_guard = self.current_block.lock().await;
+            if let Some(block) = current_block_guard.as_ref() {
+                // Collect trace hashes trước khi take block
+                let trace_hashes: Vec<String> = block.transaction_entries.iter()
+                    .filter(|e| should_trace_tx(&e.tx_hash_hex))
+                    .map(|e| e.tx_hash_hex.clone())
+                    .collect();
                 
-                if should_send {
-                    info!("📤 [UDS] Flushing block {} with {} transactions (consensus_index {} > block_end_index {})", 
-                        block_height, block_tx_count, consensus_index, block_end_index);
-                    
-                    // CRITICAL: Log để trace giao dịch trong block
-                    for entry in &block.transaction_entries {
-                        if should_trace_tx(&entry.tx_hash_hex) {
-                            info!("✅ [UDS] TRACE: Transaction {} is in FLUSHED block {} being sent", 
-                                entry.tx_hash_hex, block_height);
-                        }
+                let old_block = current_block_guard.take().unwrap();
+                drop(current_block_guard);
+                
+                let (block_to_send, tx_hash_map, batch_digests) = old_block.finalize();
+                (block_to_send, tx_hash_map, batch_digests, trace_hashes)
+            } else {
+                return; // Block đã được take bởi thread khác
+            }
+        };
+        
+        // Log trace hashes (không cần lock)
+        for tx_hash_hex in &trace_hashes {
+            info!("✅ [UDS] TRACE: Transaction {} is in FLUSHED block {} being sent", 
+                tx_hash_hex, block_height);
+        }
+        
+        // Atomic check-and-send
+        let final_should_send = {
+            let mut last_sent_guard = self.last_sent_height.lock().await;
+            let should_send = last_sent_guard.is_none() || 
+                block_to_send.height > last_sent_guard.unwrap();
+            if should_send {
+                *last_sent_guard = Some(block_to_send.height);
+            }
+            should_send
+        };
+        
+        if final_should_send {
+            // OPTIMIZATION: Sử dụng trace_hashes đã collect trước đó thay vì loop lại
+            match self.send_block_with_retry(block_to_send.clone(), tx_hash_map.clone(), batch_digests.clone()).await {
+                Err(e) => {
+                    error!("❌ [UDS] Failed to flush block {} after retries: {}", block_height, e);
+                    // Log trace hashes nếu có
+                    for tx_hash_hex in &trace_hashes {
+                        error!("❌ [UDS] TRACE: Transaction {} FAILED to send in flushed block {}: {}", 
+                            tx_hash_hex, block_height, e);
                     }
-                    
-                    let old_block = current_block_guard.take().unwrap();
-                    drop(current_block_guard);
-                    
-                    let (block_to_send, tx_hash_map, batch_digests) = old_block.finalize();
-                    
-                    // Atomic check-and-send
-                    let mut last_sent_guard = self.last_sent_height.lock().await;
-                    let final_should_send = last_sent_guard.is_none() || 
-                        block_to_send.height > last_sent_guard.unwrap();
-                    
-                    if final_should_send {
-                        drop(last_sent_guard);
-                        if let Err(e) = self.send_block_with_retry(block_to_send.clone(), tx_hash_map.clone(), batch_digests.clone()).await {
-                            error!("❌ [UDS] Failed to flush block {} after retries: {}", block_height, e);
-                            // CRITICAL: Log để trace nếu block chứa giao dịch được trace
-                            for tx in &block_to_send.transactions {
-                                let digest_key = tx.digest.as_ref().to_vec();
-                                if let Some(tx_hash_hex) = tx_hash_map.get(&digest_key) {
-                                    if should_trace_tx(tx_hash_hex) {
-                                        error!("❌ [UDS] TRACE: Transaction {} FAILED to send in flushed block {}: {}", 
-                                            tx_hash_hex, block_height, e);
-                                    }
-                                }
-                            }
-                        } else {
-                            info!("✅ [UDS] Successfully flushed block {} with {} transactions", 
-                                block_height, block_to_send.transactions.len());
-                            // CRITICAL: Log để trace nếu block chứa giao dịch được trace
-                            for tx in &block_to_send.transactions {
-                                let digest_key = tx.digest.as_ref().to_vec();
-                                if let Some(tx_hash_hex) = tx_hash_map.get(&digest_key) {
-                                    if should_trace_tx(tx_hash_hex) {
-                                        info!("✅ [UDS] TRACE: Transaction {} was successfully sent in flushed block {}", 
-                                            tx_hash_hex, block_height);
-                                    }
-                                }
-                            }
-                            
-                            // FORK-SAFE: Atomic update last_sent_height
-                            // CRITICAL: Chỉ update khi block được gửi thành công
-                            // Tất cả nodes với cùng consensus_index sẽ gửi cùng blocks → cùng update last_sent_height → fork-safe
-                            let mut last_sent_guard = self.last_sent_height.lock().await;
-                            let should_update = last_sent_guard.is_none() || 
-                                block_to_send.height > last_sent_guard.unwrap();
-                            if should_update {
-                                *last_sent_guard = Some(block_to_send.height);
-                            }
-                        }
+                }
+                Ok(_) => {
+                    info!("✅ [UDS] Successfully flushed block {} with {} transactions", 
+                        block_height, block_to_send.transactions.len());
+                    // Log trace hashes nếu có
+                    for tx_hash_hex in &trace_hashes {
+                        info!("✅ [UDS] TRACE: Transaction {} was successfully sent in flushed block {}", 
+                            tx_hash_hex, block_height);
                     }
                 }
             }

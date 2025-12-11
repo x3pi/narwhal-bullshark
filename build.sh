@@ -51,10 +51,8 @@ if [ "$CLEAN_BUILD" = "true" ]; then
     echo "🧹 Cleaning previous build (always clean to avoid using old builds)..."
     if [ "$BUILD_MODE" == "release" ]; then
         cargo clean --release 2>/dev/null || true
-        rm -rf "./target/release" 2>/dev/null || true
     else
         cargo clean 2>/dev/null || true
-        rm -rf "./target/debug" 2>/dev/null || true
     fi
     echo "✅ Clean completed - will rebuild from scratch"
 fi
@@ -135,11 +133,9 @@ fi
 # Kiểm tra lỗi compile khác (error[...])
 if grep -q "error\[" /tmp/narwhal-build.log; then
     BUILD_FAILED=true
-    if [ "$BUILD_FAILED" != "true" ] || [ $BUILD_EXIT_CODE -eq 0 ]; then
-        if [ $BUILD_EXIT_CODE -eq 0 ]; then
-            echo ""
-            echo "❌ Build completed but compilation errors were found!"
-        fi
+    if [ $BUILD_EXIT_CODE -eq 0 ]; then
+        echo ""
+        echo "❌ Build completed but compilation errors were found!"
     fi
 fi
 

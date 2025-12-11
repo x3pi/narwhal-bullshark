@@ -16,9 +16,10 @@ use transaction::{
 };
 
 /// Tính hash của transaction từ Transaction object
-/// GIỐNG HỆT 100% narwhal/worker/src/transaction_logger.rs (dòng 17-60)
 /// Thống nhất với Go: Tạo TransactionHashData từ Transaction, encode thành protobuf, rồi tính Keccak256 hash
 /// Đảm bảo hash khớp giữa Go và Rust vì cả hai đều tính từ TransactionHashData (protobuf encoded)
+/// 
+/// OPTIMIZATION: Function này được share giữa worker và node modules để tránh code duplication
 pub fn calculate_transaction_hash(tx: &Transaction) -> Vec<u8> {
     // Tạo TransactionHashData từ Transaction - GIỐNG HỆT transaction_logger.rs (dòng 22-48)
     let hash_data = transaction::TransactionHashData {

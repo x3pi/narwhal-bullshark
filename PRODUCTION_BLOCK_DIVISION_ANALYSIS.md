@@ -389,14 +389,64 @@ Block {
 
 ---
 
+## 🔄 Recovery & Synchronization
+
+### ✅ Consensus Index rất tốt cho Recovery
+
+**Khi node bị chậm:**
+
+1. **Gap xác định rõ ràng** ⭐⭐⭐⭐⭐
+   ```rust
+   // Gap: [next_cert_index, consensus_next_index - 1]
+   // Ví dụ: [100, 149] - Tuần tự, không có skip
+   let missing = consensus_store
+       .read_sequenced_certificates(&(100..=149))?;
+   ```
+
+2. **Range query đơn giản** ⭐⭐⭐⭐⭐
+   - Query trực tiếp: `read_sequenced_certificates(&range)`
+   - O(n) với n = số certificates
+   - Không cần check từng item
+
+3. **Tính toán block dễ dàng** ⭐⭐⭐⭐⭐
+   ```rust
+   // Tính block height từ consensus_index
+   let block_height = consensus_index / BLOCK_SIZE;
+   // Ví dụ: consensus_index 247 → block_height 24
+   ```
+
+4. **Fill gaps đơn giản** ⭐⭐⭐⭐⭐
+   ```rust
+   // Fill gaps giữa blocks
+   for height in from_height..to_height {
+       let block_start = height * BLOCK_SIZE;
+       let block_end = (height + 1) * BLOCK_SIZE - 1;
+       // Tạo block với certificates trong range
+   }
+   ```
+
+5. **Deterministic** ⭐⭐⭐⭐⭐
+   - Tất cả nodes có cùng gap
+   - Cùng recovery process
+   - Fork-safe
+
+**So sánh với Round:**
+- ❌ Round: Phải check từng round, xử lý round skip, phức tạp hơn
+- ✅ Consensus Index: Range query đơn giản, nhanh, deterministic
+
+**Chi tiết:** Xem `RECOVERY_SYNC_ANALYSIS.md`
+
+---
+
 ## 📚 Tài liệu tham khảo
 
 - `node/src/execution_state.rs` - Implementation hiện tại
 - `consensus/src/bullshark.rs` - Consensus algorithm
 - `BLOCK_DIVISION_ANALYSIS.md` - Phân tích chi tiết
 - `BLOCK_CREATION_ANALYSIS.md` - Phân tích block creation
+- `RECOVERY_SYNC_ANALYSIS.md` - Phân tích recovery/sync
 
 ---
 
-**Kết luận cuối cùng:** **Tiếp tục dùng Consensus Index** là lựa chọn tốt nhất cho production, với các cải thiện về empty blocks handling và BLOCK_SIZE optimization.
+**Kết luận cuối cùng:** **Tiếp tục dùng Consensus Index** là lựa chọn tốt nhất cho production, với các cải thiện về empty blocks handling và BLOCK_SIZE optimization. **Consensus Index rất tốt cho recovery/sync** khi node bị chậm.
 

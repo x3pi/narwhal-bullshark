@@ -22,11 +22,14 @@ use executor::{ExecutionIndices, ExecutionState};
 use prost::Message;
 use sha3::{Digest, Keccak256};
 use hex;
-use types::BatchDigest;
+use types::{BatchDigest, ConsensusStore};
+use storage::CertificateStore;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
+    path::PathBuf,
+    fs,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -35,6 +38,7 @@ use tokio::{
     time::{sleep, Duration as TokioDuration},
 };
 use tracing::{debug, error, info, warn};
+use serde::{Serialize, Deserialize};
 
 /// Macro cho UDS debug logs - chỉ compile trong debug mode
 /// Giúp giảm overhead trong production builds
@@ -580,6 +584,13 @@ struct BlockBuilder {
     transaction_hashes: HashSet<Vec<u8>>,
 }
 
+/// Execution state persisted to disk for crash recovery
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct PersistedExecutionState {
+    last_consensus_index: u64,
+    last_sent_height: Option<u64>,
+}
+
 /// Execution state that sends blocks progressively via UDS (no batching, no size limit)
 pub struct UdsExecutionState {
     /// UDS socket path
@@ -619,6 +630,18 @@ pub struct UdsExecutionState {
     /// Track các batch đã log warning về duplicate để tránh log lặp lại (giới hạn 1000 entries)
     /// Format: HashSet<BatchDigest> - chỉ log lần đầu tiên cho mỗi batch
     logged_duplicate_batches: Arc<Mutex<HashSet<BatchDigest>>>,
+    /// Path to execution state file for persistence
+    execution_state_path: Option<PathBuf>,
+    /// Consensus store reference for catch-up mechanism
+    consensus_store: Option<Arc<ConsensusStore>>,
+    /// Certificate store reference for recovery
+    certificate_store: Option<CertificateStore>,
+    /// Threshold for triggering catch-up (number of certificates lag)
+    catch_up_threshold: u64,
+    /// Interval for checking execution lag
+    catch_up_check_interval: Duration,
+    /// Counter for persistence (persist every N certificates)
+    persistence_counter: Arc<Mutex<u64>>,
 }
 
 impl BlockBuilder {
@@ -762,6 +785,64 @@ impl BlockBuilder {
 }
 
 impl UdsExecutionState {
+    /// Persist execution state to disk
+    async fn persist_execution_state(&self) -> Result<(), String> {
+        let state_path = match &self.execution_state_path {
+            Some(path) => path,
+            None => return Ok(()), // No persistence path configured
+        };
+
+        let state = {
+            let last_consensus_index = *self.last_consensus_index.lock().await;
+            let last_sent_height = *self.last_sent_height.lock().await;
+            PersistedExecutionState {
+                last_consensus_index,
+                last_sent_height,
+            }
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string_pretty(&state)
+            .map_err(|e| format!("Failed to serialize execution state: {}", e))?;
+
+        // Write atomically: write to temp file, then rename
+        let temp_path = state_path.with_extension("tmp");
+        fs::write(&temp_path, json)
+            .map_err(|e| format!("Failed to write execution state to {}: {}", temp_path.display(), e))?;
+        
+        fs::rename(&temp_path, state_path)
+            .map_err(|e| format!("Failed to rename execution state file: {}", e))?;
+
+        debug!("💾 [UDS] Persisted execution state: last_consensus_index={}, last_sent_height={:?}", 
+            state.last_consensus_index, state.last_sent_height);
+        
+        Ok(())
+    }
+
+    /// Load execution state from disk
+    async fn load_execution_state(&self) -> Result<PersistedExecutionState, String> {
+        let state_path = match &self.execution_state_path {
+            Some(path) => path,
+            None => return Ok(PersistedExecutionState::default()), // No persistence path configured
+        };
+
+        if !state_path.exists() {
+            debug!("💾 [UDS] Execution state file does not exist: {}, using default", state_path.display());
+            return Ok(PersistedExecutionState::default());
+        }
+
+        let json = fs::read_to_string(state_path)
+            .map_err(|e| format!("Failed to read execution state from {}: {}", state_path.display(), e))?;
+
+        let state: PersistedExecutionState = serde_json::from_str(&json)
+            .map_err(|e| format!("Failed to deserialize execution state: {}", e))?;
+
+        info!("💾 [UDS] Loaded execution state: last_consensus_index={}, last_sent_height={:?}", 
+            state.last_consensus_index, state.last_sent_height);
+
+        Ok(state)
+    }
+
     pub fn new(
         socket_path: String,
         epoch: u64,
@@ -797,8 +878,34 @@ impl UdsExecutionState {
         missed_batch_timeout_ms: u64,
         max_missed_batch_retries: u32,
     ) -> Self {
-        info!("🚀 [UDS] Creating UdsExecutionState: socket_path='{}', epoch={}, empty_block_timeout_ms={}, max_retries={}, retry_delay_base_ms={}, missed_batch_timeout_ms={}, max_missed_batch_retries={}", 
-            socket_path, epoch, empty_block_timeout_ms, max_send_retries, retry_delay_base_ms, missed_batch_timeout_ms, max_missed_batch_retries);
+        Self::new_with_state_and_stores(
+            socket_path,
+            epoch,
+            empty_block_timeout_ms,
+            max_send_retries,
+            retry_delay_base_ms,
+            missed_batch_timeout_ms,
+            max_missed_batch_retries,
+            None::<PathBuf>, // execution_state_path
+            None::<Arc<ConsensusStore>>, // consensus_store
+            None::<CertificateStore>, // certificate_store
+        )
+    }
+
+    pub fn new_with_state_and_stores(
+        socket_path: String,
+        epoch: u64,
+        empty_block_timeout_ms: u64,
+        max_send_retries: u32,
+        retry_delay_base_ms: u64,
+        missed_batch_timeout_ms: u64,
+        max_missed_batch_retries: u32,
+        execution_state_path: Option<PathBuf>,
+        consensus_store: Option<Arc<ConsensusStore>>,
+        certificate_store: Option<CertificateStore>,
+    ) -> Self {
+        info!("🚀 [UDS] Creating UdsExecutionState: socket_path='{}', epoch={}, empty_block_timeout_ms={}, max_retries={}, retry_delay_base_ms={}, missed_batch_timeout_ms={}, max_missed_batch_retries={}, execution_state_path={:?}", 
+            socket_path, epoch, empty_block_timeout_ms, max_send_retries, retry_delay_base_ms, missed_batch_timeout_ms, max_missed_batch_retries, execution_state_path);
         Self {
             socket_path,
             epoch,
@@ -814,7 +921,218 @@ impl UdsExecutionState {
             missed_batch_timeout_ms,
             max_missed_batch_retries,
             logged_duplicate_batches: Arc::new(Mutex::new(HashSet::new())),
+            execution_state_path,
+            consensus_store,
+            certificate_store,
+            catch_up_threshold: 50, // Default: 50 certificates lag
+            catch_up_check_interval: Duration::from_secs(10), // Default: 10 seconds
+            persistence_counter: Arc::new(Mutex::new(0)),
         }
+    }
+
+    /// Initialize execution state by loading from disk
+    /// This should be called after construction to load persisted state
+    pub async fn initialize(&self) -> Result<(), String> {
+        let loaded_state = self.load_execution_state().await?;
+        *self.last_consensus_index.lock().await = loaded_state.last_consensus_index;
+        *self.last_sent_height.lock().await = loaded_state.last_sent_height;
+        info!("✅ [UDS] Initialized execution state: last_consensus_index={}, last_sent_height={:?}", 
+            loaded_state.last_consensus_index, loaded_state.last_sent_height);
+        Ok(())
+    }
+
+    /// Spawn background task for periodic catch-up checks
+    /// This should be called after initialization
+    pub fn spawn_catchup_task(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(self.catch_up_check_interval);
+            loop {
+                interval.tick().await;
+                
+                match self.check_execution_lag().await {
+                    Ok(Some(execution_index)) => {
+                        // Lag detected, trigger recovery
+                        let consensus_store = match &self.consensus_store {
+                            Some(store) => store,
+                            None => continue, // No consensus store configured
+                        };
+
+                        let consensus_index = match consensus_store.read_last_consensus_index() {
+                            Ok(idx) => idx,
+                            Err(e) => {
+                                error!("❌ [UDS] Failed to read last consensus index for recovery: {}", e);
+                                continue;
+                            }
+                        };
+
+                        if let Err(e) = self.trigger_recovery(execution_index, consensus_index).await {
+                            error!("❌ [UDS] Recovery failed: {}", e);
+                        }
+                    }
+                    Ok(None) => {
+                        // No lag detected
+                        debug!("✅ [UDS] Execution is in sync");
+                    }
+                    Err(e) => {
+                        warn!("⚠️ [UDS] Error checking execution lag: {}", e);
+                    }
+                }
+            }
+        })
+    }
+
+    /// Check if execution is lagging behind consensus
+    /// Returns Some(execution_index) if lag is detected, None otherwise
+    async fn check_execution_lag(&self) -> Result<Option<u64>, String> {
+        let consensus_store = match &self.consensus_store {
+            Some(store) => store,
+            None => return Ok(None), // No consensus store configured
+        };
+
+        let consensus_next_index = consensus_store
+            .read_last_consensus_index()
+            .map_err(|e| format!("Failed to read last consensus index: {}", e))?;
+
+        let execution_index = {
+            let guard = self.last_consensus_index.lock().await;
+            *guard
+        };
+
+        if consensus_next_index > execution_index + self.catch_up_threshold {
+            warn!("⚠️ [UDS] Execution lag detected: consensus_index={}, execution_index={}, lag={}", 
+                consensus_next_index, execution_index, consensus_next_index - execution_index);
+            Ok(Some(execution_index))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Trigger recovery by reading and re-processing missing certificates
+    /// CRITICAL: Đảm bảo blocks được tạo tuần tự và gửi qua UDS trong quá trình recovery
+    /// - Xử lý certificates tuần tự theo consensus_index (deterministic, fork-safe)
+    /// - Tạo blocks từ certificates (có thể empty nếu không có transaction data)
+    /// - Gửi blocks qua UDS để đảm bảo execution tăng tiến
+    /// - Flush tất cả pending blocks sau recovery
+    async fn trigger_recovery(&self, start_index: u64, end_index: u64) -> Result<(), String> {
+        let consensus_store = match &self.consensus_store {
+            Some(store) => store,
+            None => return Err("Consensus store not configured".to_string()),
+        };
+
+        let certificate_store = match &self.certificate_store {
+            Some(store) => store,
+            None => return Err("Certificate store not configured".to_string()),
+        };
+
+        info!("🔄 [UDS] Starting recovery: reading certificates from {} to {} (ensuring sequential block creation and UDS sending)", 
+            start_index, end_index - 1);
+
+        // Read missing certificates from consensus store
+        // CRITICAL: Đọc tuần tự theo consensus_index để đảm bảo deterministic và fork-safe
+        let missing = consensus_store
+            .read_sequenced_certificates(&(start_index..=end_index - 1))
+            .map_err(|e| format!("Failed to read sequenced certificates: {}", e))?;
+
+        let mut recovered_count = 0;
+        let mut last_processed_index = start_index.saturating_sub(1);
+        
+        // CRITICAL: Xử lý certificates tuần tự theo consensus_index
+        // Đảm bảo blocks được tạo tuần tự và gửi qua UDS
+        for (cert_digest_opt, seq) in missing.iter().zip(start_index..end_index) {
+            if let Some(cert_digest) = cert_digest_opt {
+                // Read certificate from certificate store
+                if let Ok(Some(cert)) = certificate_store.read(*cert_digest) {
+                    // CRITICAL: Đảm bảo xử lý tuần tự theo consensus_index
+                    // handle_consensus_transaction sẽ tự động xử lý gaps thông qua
+                    // fill_missing_blocks và flush_current_block_if_needed
+                    
+                    // Create ConsensusOutput
+                    let consensus_output = ConsensusOutput {
+                        certificate: cert.clone(),
+                        consensus_index: seq,
+                    };
+
+                    // Create ExecutionIndices
+                    // CRITICAL: Tính toán ExecutionIndices đúng để đảm bảo deterministic processing
+                    let execution_indices = ExecutionIndices {
+                        next_certificate_index: seq,
+                        next_batch_index: 0, // Recovery không có batch index info, dùng 0
+                        next_transaction_index: 0, // Recovery không có transaction index info, dùng 0
+                    };
+
+                    // CRITICAL: Check xem certificate đã được processed chưa
+                    // Nếu đã processed (consensus_index <= last_consensus_index), skip để tránh duplicate
+                    let should_process = {
+                        let guard = self.last_consensus_index.lock().await;
+                        seq > *guard
+                    };
+                    
+                    if should_process {
+                        // CRITICAL: Re-process certificate tuần tự
+                        // handle_consensus_transaction sẽ:
+                        // 1. Tạo blocks từ certificates (có thể empty nếu không có transaction data)
+                        // 2. Gửi blocks qua UDS khi đủ BLOCK_SIZE certificates
+                        // 3. Đảm bảo sequential execution và fork-safe
+                        // NOTE: Recovery không có transaction data, chỉ tạo empty blocks để đảm bảo sequential execution
+                        self.handle_consensus_transaction(&consensus_output, execution_indices, Vec::new()).await;
+                    } else {
+                        debug!("⏭️ [UDS] Skipping certificate in recovery: consensus_index={} <= last_consensus_index (already processed)", seq);
+                    }
+                    
+                    last_processed_index = seq;
+                    recovered_count += 1;
+                } else {
+                    warn!("⚠️ [UDS] Certificate not found in store: {:?}, consensus_index={}", cert_digest, seq);
+                    // Vẫn update last_processed_index để không tạo duplicate empty blocks
+                    last_processed_index = seq;
+                }
+            } else {
+                // Certificate digest không có → consensus_index này không có certificate
+                // CRITICAL: Không tạo block cho consensus_index không có certificate
+                // Chỉ update last_processed_index để tiếp tục xử lý
+                warn!("⚠️ [UDS] Certificate digest not found for consensus_index={}, skipping (no certificate)", seq);
+                last_processed_index = seq;
+            }
+        }
+
+        // CRITICAL: Flush tất cả pending blocks sau recovery
+        // Đảm bảo tất cả blocks được gửi qua UDS, không bỏ sót
+        let last_consensus_index = {
+            let guard = self.last_consensus_index.lock().await;
+            *guard
+        };
+        
+        // Flush current block nếu có (đảm bảo block cuối cùng được gửi)
+        self.flush_current_block_if_needed(last_consensus_index).await;
+        
+        // CRITICAL: Đảm bảo tất cả blocks đã được gửi qua UDS
+        // Kiểm tra và fill gaps nếu cần (đảm bảo sequential execution và không fork)
+        let last_sent_height = {
+            let guard = self.last_sent_height.lock().await;
+            *guard
+        };
+        
+        if let Some(last_sent) = last_sent_height {
+            let expected_last_block = last_consensus_index / BLOCK_SIZE;
+            if expected_last_block > last_sent {
+                // Có blocks chưa được gửi → fill gaps
+                info!("🔄 [UDS] Filling gaps after recovery: last_sent={}, expected_last_block={}", 
+                    last_sent, expected_last_block);
+                if let Err(e) = self.send_empty_blocks_for_gaps(last_sent + 1, expected_last_block + 1).await {
+                    warn!("⚠️ [UDS] Failed to fill gaps after recovery: {}", e);
+                }
+            }
+        }
+        
+        info!("✅ [UDS] Recovery completed: recovered {} certificates from {} to {}, last_consensus_index={}", 
+            recovered_count, start_index, end_index - 1, last_consensus_index);
+
+        // Persist state after recovery
+        if let Err(e) = self.persist_execution_state().await {
+            warn!("⚠️ [UDS] Failed to persist execution state after recovery: {}", e);
+        }
+
+        Ok(())
     }
 
     async fn ensure_connection(&self) -> Result<(), String> {
@@ -1292,6 +1610,20 @@ impl ExecutionState for UdsExecutionState {
             *last_consensus_guard = consensus_index;
         }
         drop(last_consensus_guard);
+        
+        // Periodic persistence: persist every 10 certificates
+        // Note: Persistence is done synchronously but quickly (just file I/O)
+        let mut counter_guard = self.persistence_counter.lock().await;
+        *counter_guard += 1;
+        let should_persist_now = *counter_guard >= 10; // Persist every 10 certificates
+        if should_persist_now {
+            *counter_guard = 0;
+            drop(counter_guard);
+            // Persist execution state (non-blocking file I/O)
+            if let Err(e) = self.persist_execution_state().await {
+                warn!("⚠️ [UDS] Failed to persist execution state: {}", e);
+            }
+        }
         
         // CRITICAL: Extract batch digest từ certificate payload để check duplicate TRƯỚC KHI parse/log
         // Tối ưu: Check duplicate sớm để tránh parse/log không cần thiết khi batch đã processed
@@ -1986,6 +2318,12 @@ impl ExecutionState for UdsExecutionState {
                             if should_update {
                                 *last_sent_guard = Some(block_to_send.height);
                             }
+                            drop(last_sent_guard);
+                            
+                            // Persist state after sending block successfully
+                            if let Err(e) = self.persist_execution_state().await {
+                                warn!("⚠️ [UDS] Failed to persist execution state after sending block {}: {}", block_to_send.height, e);
+                            }
                         }
                     } else {
                         warn!("⚠️ [UDS] Block {} already sent (last_sent_height check), skipping", old_block_height);
@@ -2035,7 +2373,16 @@ impl ExecutionState for UdsExecutionState {
     }
 
     async fn load_execution_indices(&self) -> ExecutionIndices {
-        ExecutionIndices::default()
+        let last_consensus_index = {
+            let guard = self.last_consensus_index.lock().await;
+            *guard
+        };
+        
+        ExecutionIndices {
+            next_certificate_index: last_consensus_index + 1,
+            next_batch_index: 0,
+            next_transaction_index: 0,
+        }
     }
 }
 
@@ -2371,7 +2718,16 @@ impl UdsExecutionState {
     }
 
     async fn load_execution_indices(&self) -> ExecutionIndices {
-        ExecutionIndices::default()
+        let last_consensus_index = {
+            let guard = self.last_consensus_index.lock().await;
+            *guard
+        };
+        
+        ExecutionIndices {
+            next_certificate_index: last_consensus_index + 1,
+            next_batch_index: 0,
+            next_transaction_index: 0,
+        }
     }
 }
 
@@ -2401,6 +2757,7 @@ impl ExecutionState for SimpleExecutionState {
     }
 
     async fn load_execution_indices(&self) -> ExecutionIndices {
+        // SimpleExecutionState doesn't track state, return default
         ExecutionIndices::default()
     }
 }

@@ -26,7 +26,7 @@ use prometheus::Registry;
 use std::sync::Arc;
 use telemetry_subscribers::TelemetryGuards;
 use tokio::sync::mpsc::{channel, Receiver};
-use tracing::info;
+use tracing::{info, warn};
 #[cfg(feature = "benchmark")]
 use tracing::subscriber::set_global_default;
 #[cfg(feature = "benchmark")]
@@ -278,11 +278,30 @@ async fn run(
             if !parameters.uds_block_path.trim().is_empty() {
                 let epoch = (**committee.load()).epoch;
                 info!("Using UdsExecutionState with UDS path: {}", parameters.uds_block_path);
-                let uds_state = Arc::new(UdsExecutionState::new(
+                
+                // Create execution state path from store path
+                let execution_state_path = std::path::PathBuf::from(store_path).join("execution_state.json");
+                
+                let uds_state = Arc::new(UdsExecutionState::new_with_state_and_stores(
                     parameters.uds_block_path.clone(),
                     epoch,
                     100, // empty_block_timeout_ms: 100ms - send empty blocks if no transactions for this duration
+                    3, // max_send_retries
+                    100, // retry_delay_base_ms
+                    5000, // missed_batch_timeout_ms (5 seconds)
+                    3, // max_missed_batch_retries
+                    Some(execution_state_path), // execution_state_path
+                    Some(store.consensus_store.clone()), // consensus_store
+                    Some(store.certificate_store.clone()), // certificate_store
                 ));
+                
+                // Initialize execution state (load from disk)
+                if let Err(e) = uds_state.initialize().await {
+                    warn!("⚠️ Failed to initialize execution state: {}", e);
+                }
+                
+                // Spawn catch-up task
+                let _catchup_handle = uds_state.clone().spawn_catchup_task();
                 
                 Node::spawn_primary(
                     primary_keypair,

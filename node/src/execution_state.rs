@@ -985,7 +985,7 @@ impl UdsExecutionState {
             loaded_state.last_consensus_index, loaded_state.last_sent_height);
         Ok(())
     }
-
+    
     /// Spawn background task for periodic catch-up checks
     /// This should be called after initialization
     pub fn spawn_catchup_task(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -1049,8 +1049,8 @@ impl UdsExecutionState {
             Ok(Some(execution_index))
         } else {
             Ok(None)
-        }
-    }
+                            }
+                        }
 
     /// Trigger recovery by reading and re-processing missing certificates
     /// CRITICAL: Đảm bảo blocks được tạo tuần tự và gửi qua UDS trong quá trình recovery
@@ -1137,9 +1137,9 @@ impl UdsExecutionState {
                 // Chỉ update last_processed_index để tiếp tục xử lý
                 warn!("⚠️ [UDS] Certificate digest not found for consensus_index={}, skipping (no certificate)", seq);
                 last_processed_index = seq;
-            }
-        }
-
+                                    }
+                                }
+                                
         // CRITICAL: Flush tất cả pending blocks sau recovery
         // Đảm bảo tất cả blocks được gửi qua UDS, không bỏ sót
         let last_consensus_index = {
@@ -1188,7 +1188,7 @@ impl UdsExecutionState {
                 .map_err(|e| format!("Failed to connect to UDS {}: {}", self.socket_path, e))?;
             *stream_guard = Some(stream);
             info!("✅ [UDS] Connected to Unix Domain Socket: {}", self.socket_path);
-        }
+                                        }
         Ok(())
     }
 
@@ -1231,19 +1231,19 @@ impl UdsExecutionState {
                             block.height, last_sent);
                     }
                     return Ok(()); // Block đã được gửi thành công
-                }
             }
+        }
             drop(last_sent_guard);
             
             // Không có duplicate → gọi send_block_internal
             match self.send_block_internal(block.clone(), &tx_hash_map).await {
-                Ok(_) => {
+            Ok(_) => {
                     if attempt > 0 {
                         info!("✅ [UDS] Block {} sent successfully after {} retries", block.height, attempt);
                     }
                     return Ok(());
-                }
-                Err(e) => {
+            }
+            Err(e) => {
                     last_error = Some(e.clone());
                     if attempt < self.max_send_retries - 1 {
                         // Chờ một khoảng thời gian trước khi retry (exponential backoff)
@@ -1789,32 +1789,32 @@ impl ExecutionState for UdsExecutionState {
         
         if let Some(last_sent_val) = last_sent {
             if block_height <= last_sent_val {
-                // Block đã gửi rồi → certificate này đến muộn (không nên xảy ra với consensus_index tuần tự)
-                // PRODUCTION: Buffer late certificate để retry sau
-                warn!(
-                    "⚠️ [UDS] Late certificate for already-sent block: Round={}, BlockHeight={}, LastSent={}, ConsensusIndex={}, HasTransaction={}. Buffering for retry.",
-                    round, block_height, last_sent_val, consensus_index, has_transaction
-                );
-                
-                // Buffer late certificate info để monitoring
-                let mut late_certs = self.late_certificates.lock().await;
-                
-                // Giới hạn buffer size để tránh memory leak
-                if late_certs.len() >= 1000 {
-                    warn!("⚠️ [UDS] Late certificate buffer full ({}). Dropping oldest entries.", late_certs.len());
-                    late_certs.drain(0..500); // Remove oldest 500
-                }
-                
-                // Lưu thông tin để monitoring
-                late_certs.push((block_height, consensus_index, round, has_transaction));
-                
-                // Với consensus_index tuần tự, late certificate không nên xảy ra
-                // Nếu xảy ra, có thể là bug hoặc network issue
-                // Note: Không thể retry vì ConsensusOutput không có Clone
-                error!("❌ [UDS] Late certificate detected (cannot retry). This should not happen with sequential consensus_index! Round={}, ConsensusIndex={}, BlockHeight={}, LastSent={}, HasTransaction={}", 
-                    round, consensus_index, block_height, last_sent_val, has_transaction);
-                
-                return;
+                    // Block đã gửi rồi → certificate này đến muộn (không nên xảy ra với consensus_index tuần tự)
+                    // PRODUCTION: Buffer late certificate để retry sau
+                    warn!(
+                        "⚠️ [UDS] Late certificate for already-sent block: Round={}, BlockHeight={}, LastSent={}, ConsensusIndex={}, HasTransaction={}. Buffering for retry.",
+                        round, block_height, last_sent_val, consensus_index, has_transaction
+                    );
+                    
+                    // Buffer late certificate info để monitoring
+                    let mut late_certs = self.late_certificates.lock().await;
+                    
+                    // Giới hạn buffer size để tránh memory leak
+                    if late_certs.len() >= 1000 {
+                        warn!("⚠️ [UDS] Late certificate buffer full ({}). Dropping oldest entries.", late_certs.len());
+                        late_certs.drain(0..500); // Remove oldest 500
+                    }
+                    
+                    // Lưu thông tin để monitoring
+                    late_certs.push((block_height, consensus_index, round, has_transaction));
+                    
+                    // Với consensus_index tuần tự, late certificate không nên xảy ra
+                    // Nếu xảy ra, có thể là bug hoặc network issue
+                    // Note: Không thể retry vì ConsensusOutput không có Clone
+                    error!("❌ [UDS] Late certificate detected (cannot retry). This should not happen with sequential consensus_index! Round={}, ConsensusIndex={}, BlockHeight={}, LastSent={}, HasTransaction={}", 
+                        round, consensus_index, block_height, last_sent_val, has_transaction);
+                    
+                    return;
             }
         }
         
@@ -2725,19 +2725,19 @@ impl UdsExecutionState {
                                 // Update global_state
                                 self.update_global_state().await;
                                 
-                                if !block_to_send.transactions.is_empty() {
+                            if !block_to_send.transactions.is_empty() {
                                     info!("✅ [UDS] Block {} sent successfully with {} transactions", 
-                                        block_to_send.height, block_to_send.transactions.len());
-                                    
-                                    // Log transaction hashes để trace (dùng hash đã lưu sẵn - đảm bảo nhất quán)
-                                    for (idx, tx) in block_to_send.transactions.iter().enumerate() {
-                                        let digest_key = tx.digest.as_ref().to_vec();
-                                        if let Some(tx_hash_hex) = tx_hash_map_clone.get(&digest_key) {
-                                            info!("  ✅ [UDS] Block {} Tx[{}] executed: TxHash={}, WorkerId={}", 
-                                                block_to_send.height, idx, tx_hash_hex, tx.worker_id);
-                                        } else {
-                                            error!("  ❌ [UDS] Block {} Tx[{}] executed but hash not found in map: WorkerId={}", 
-                                                block_to_send.height, idx, tx.worker_id);
+                                    block_to_send.height, block_to_send.transactions.len());
+                                
+                                // Log transaction hashes để trace (dùng hash đã lưu sẵn - đảm bảo nhất quán)
+                                for (idx, tx) in block_to_send.transactions.iter().enumerate() {
+                                    let digest_key = tx.digest.as_ref().to_vec();
+                                    if let Some(tx_hash_hex) = tx_hash_map_clone.get(&digest_key) {
+                                        info!("  ✅ [UDS] Block {} Tx[{}] executed: TxHash={}, WorkerId={}", 
+                                            block_to_send.height, idx, tx_hash_hex, tx.worker_id);
+                                    } else {
+                                        error!("  ❌ [UDS] Block {} Tx[{}] executed but hash not found in map: WorkerId={}", 
+                                            block_to_send.height, idx, tx.worker_id);
                                         }
                                     }
                                 }

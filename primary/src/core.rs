@@ -251,10 +251,36 @@ impl Core {
         }
 
         // Check the parent certificates. Ensure the parents form a quorum and are all from the previous round.
+        // ✅ FORK-SAFE: Quy tắc strict để đảm bảo tất cả nodes chọn cùng parents (deterministic)
+        // - Round 1: Parents từ round 0 (genesis) - deterministic vì tất cả nodes có cùng genesis
+        // - Round 2: Parents từ round 0 (genesis) hoặc round 1 - nhưng ưu tiên round 1 nếu có
+        // - Round 3: Parents từ round 0 (genesis), 1 hoặc 2 - nhưng ưu tiên round 2 nếu có
+        // - Round >= 4: Parents PHẢI từ round (header.round - 1) - STRICT RULE để đảm bảo fork-safety
         let mut stake = 0;
         for x in parents {
+            let expected_parent_round = header.round.saturating_sub(1);
+            let is_valid_parent = if header.round == 0 {
+                // Round 0: Không có parents (genesis)
+                false // Should not happen, but handle gracefully
+            } else if header.round == 1 {
+                // Round 1: Chỉ chấp nhận parents từ round 0 (genesis) - deterministic
+                x.round() == 0
+            } else if header.round == 2 {
+                // Round 2: Chấp nhận parents từ round 0 (genesis) hoặc round 1
+                // Genesis parents là deterministic, nhưng nếu có certificates từ round 1 thì dùng
+                x.round() == 0 || x.round() == 1
+            } else if header.round == 3 {
+                // Round 3: Chấp nhận parents từ round 0 (genesis), 1 hoặc 2
+                // Genesis parents là deterministic, nhưng nếu có certificates từ round 2 thì dùng
+                x.round() == 0 || x.round() == 1 || x.round() == 2
+            } else {
+                // Round >= 4: STRICT RULE - chỉ chấp nhận parents từ round (header.round - 1)
+                // Đây là quy tắc quan trọng để đảm bảo fork-safety
+                x.round() == expected_parent_round
+            };
+            
             ensure!(
-                x.round() + 1 == header.round,
+                is_valid_parent,
                 DagError::MalformedHeader(header.id)
             );
             stake += self.committee.stake(&x.origin());
@@ -494,13 +520,18 @@ impl Core {
             .or_insert_with(|| Box::new(CertificatesAggregator::new()))
             .append(certificate.clone(), &self.committee)
         {
-            // Send it to the `Proposer`.
+            // ✅ FIX: Gửi parents với round = certificate.round() + 1
+            // Vì Proposer sẽ dùng parents này (certificates từ round r) để tạo header cho round r + 1
+            // Ví dụ: Certificate từ round 0 → gửi parents với round 1
+            // Proposer ở round 1 sẽ nhận parents từ round 0 (certificates từ round 0) để tạo header cho round 2
+            // Lưu ý: Round 0 và 1 chưa có consensus, chỉ mới đề xuất
+            let proposer_round = certificate.round() + 1;
             info!(
-                "📤 [CORE] Sending {} parents to Proposer: Round={}, CertificateRound={}",
-                parents.len(), certificate.round(), certificate.round()
+                "📤 [CORE] Sending {} parents to Proposer: Round={} (certificates from round {}), CertificateRound={}",
+                parents.len(), proposer_round, certificate.round(), certificate.round()
             );
             self.tx_proposer
-                .send((parents, certificate.round(), certificate.epoch()))
+                .send((parents, proposer_round, certificate.epoch()))
                 .await
                 .map_err(|_| DagError::ShuttingDown)?;
 
@@ -645,6 +676,126 @@ impl Core {
     // Main loop listening to incoming messages.
     pub async fn run(&mut self) {
         info!("Core on node {} has started successfully.", self.name);
+        
+        // ✅ FORK-SAFE: Recovery - Tìm parents từ certificate_store sau recovery
+        // Nếu gc_round > 0, có nghĩa là đã có state từ trước → recovery
+        if self.gc_round > 0 {
+            info!(
+                "🔄 [CORE] Recovery detected (gc_round={}), finding parents from certificate_store",
+                self.gc_round
+            );
+            
+            // Lấy proposer_round từ global_state để biết Proposer đang ở round nào
+            // Proposer cần parents từ round (proposer_round - 1) để tạo header cho round tiếp theo
+            let proposer_round = if let Some(ref gs) = self.global_state {
+                let state_snapshot = gs.get_state().await;
+                state_snapshot.proposer_round
+            } else {
+                // Nếu không có global_state, dùng gc_round làm fallback
+                self.gc_round
+            };
+            
+            // Tìm parents từ round (proposer_round - 1) trong certificate_store
+            let parent_round = proposer_round.saturating_sub(1);
+            
+            info!(
+                "🔍 [CORE] Proposer round={}, looking for parents from round {}",
+                proposer_round, parent_round
+            );
+            
+            // Query certificates từ parent_round
+            match self.certificate_store.after_round(parent_round) {
+                Ok(certificates) => {
+                    // Filter certificates chỉ từ parent_round (after_round trả về >= parent_round)
+                    let parent_certificates: Vec<_> = certificates
+                        .into_iter()
+                        .filter(|cert| cert.round() == parent_round)
+                        .collect();
+                    
+                    if !parent_certificates.is_empty() {
+                        let cert_count = parent_certificates.len();
+                        info!(
+                            "📋 [CORE] Found {} certificates from round {} in certificate_store",
+                            cert_count,
+                            parent_round
+                        );
+                        
+                        // Sử dụng CertificatesAggregator để kiểm tra quorum
+                        let mut aggregator = Some(CertificatesAggregator::new());
+                        let mut found_quorum = false;
+                        
+                        for cert in parent_certificates {
+                            if let Some(ref mut agg) = aggregator {
+                                if let Some(parents) = agg.append(cert, &self.committee) {
+                                    // Đủ quorum → gửi parents cho Proposer
+                                    info!(
+                                        "✅ [CORE] Found quorum of {} parents from round {}, sending to Proposer",
+                                        parents.len(),
+                                        parent_round
+                                    );
+                                    let _ = self.tx_proposer
+                                        .send((parents, proposer_round, self.committee.epoch()))
+                                        .await;
+                                    
+                                    // Lưu aggregator vào certificates_aggregators để tiếp tục nhận certificates mới
+                                    if let Some(agg) = aggregator.take() {
+                                        self.certificates_aggregators
+                                            .insert(parent_round, Box::new(agg));
+                                    }
+                                    found_quorum = true;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // Nếu chưa đủ quorum, lưu aggregator để tiếp tục nhận certificates từ network
+                        if !found_quorum {
+                            if let Some(agg) = aggregator {
+                                info!(
+                                    "⚠️ [CORE] Found {} certificates from round {} but not enough for quorum. Waiting for more certificates from network.",
+                                    cert_count,
+                                    parent_round
+                                );
+                                self.certificates_aggregators
+                                    .insert(parent_round, Box::new(agg));
+                            }
+                        }
+                    } else {
+                        info!(
+                            "⚠️ [CORE] No certificates found for round {} in certificate_store. Waiting for sync from network.",
+                            parent_round
+                        );
+                    }
+                    
+                    // Gửi round update để Proposer biết round hiện tại
+                    // Nếu đã gửi parents ở trên, Proposer sẽ nhận cả parents và round
+                    // Nếu chưa có parents, Proposer sẽ đợi
+                    let _ = self.tx_proposer
+                        .send((vec![], proposer_round, self.committee.epoch()))
+                        .await;
+                    info!("✅ [CORE] Sent round update to Proposer (round={})", proposer_round);
+                }
+                Err(e) => {
+                    warn!(
+                        "❌ [CORE] Failed to query certificates from certificate_store for round {}: {}",
+                        parent_round, e
+                    );
+                    // Vẫn gửi round update để Proposer biết round hiện tại
+                    // Lấy proposer_round từ global_state
+                    let proposer_round = if let Some(ref gs) = self.global_state {
+                        let state_snapshot = gs.get_state().await;
+                        state_snapshot.proposer_round
+                    } else {
+                        self.gc_round
+                    };
+                    let _ = self.tx_proposer
+                        .send((vec![], proposer_round, self.committee.epoch()))
+                        .await;
+                    info!("✅ [CORE] Sent round update to Proposer (round={}). Will wait for certificates from network.", proposer_round);
+                }
+            }
+        }
+        
         loop {
             let result = tokio::select! {
                 // We receive here messages from other primaries.

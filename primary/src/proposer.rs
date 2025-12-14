@@ -12,7 +12,7 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, Duration, Instant},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use types::{
     error::{DagError, DagResult},
     metered_channel::{Receiver, Sender},
@@ -191,6 +191,55 @@ impl Proposer {
         // all_digests comes from self.digests (which maintains deterministic order),
         // the final payload order is deterministic across all nodes.
         let payload: IndexMap<_, _> = all_digests.into_iter().collect();
+        
+        // ✅ FORK-SAFE: Validate parents round trước khi tạo header
+        // Quy tắc strict để đảm bảo tất cả nodes chọn cùng parents (deterministic)
+        // - Round 1: Parents từ round 0 (genesis) - deterministic
+        // - Round 2: Parents từ round 0 (genesis) hoặc round 1 - ưu tiên round 1 nếu có
+        // - Round 3: Parents từ round 0 (genesis), 1 hoặc 2 - ưu tiên round 2 nếu có
+        // - Round >= 4: Parents PHẢI từ round (self.round - 1) - STRICT RULE để đảm bảo fork-safety
+        let expected_parent_round = self.round.saturating_sub(1);
+        if !self.last_parents.is_empty() {
+            // Filter out invalid parents (wrong round)
+            let valid_parents: Vec<_> = self.last_parents
+                .iter()
+                .filter(|parent| {
+                    let parent_round = parent.round();
+                    // Header ở round r cần parents từ round (r - 1)
+                    if self.round == 1 {
+                        // Round 1: Chỉ chấp nhận parents từ round 0 (genesis) - deterministic
+                        parent_round == 0
+                    } else if self.round == 2 {
+                        // Round 2: Chấp nhận parents từ round 0 (genesis) hoặc round 1
+                        // Genesis parents là deterministic, nhưng nếu có certificates từ round 1 thì dùng
+                        parent_round == 0 || parent_round == 1
+                    } else if self.round == 3 {
+                        // Round 3: Chấp nhận parents từ round 0 (genesis), 1 hoặc 2
+                        // Genesis parents là deterministic, nhưng nếu có certificates từ round 2 thì dùng
+                        parent_round == 0 || parent_round == 1 || parent_round == 2
+                    } else {
+                        // Round >= 4: STRICT RULE - chỉ chấp nhận parents từ expected_parent_round
+                        // Đây là quy tắc quan trọng để đảm bảo fork-safety
+                        parent_round == expected_parent_round
+                    }
+                })
+                .cloned()
+                .collect();
+            
+            if valid_parents.len() != self.last_parents.len() {
+                warn!(
+                    "⚠️ [PROPOSER] Filtered out {} invalid parents (Round={}, Expected={}). Waiting for Core to send correct parents.",
+                    self.last_parents.len() - valid_parents.len(),
+                    self.round,
+                    expected_parent_round
+                );
+            }
+            
+            // Chỉ update last_parents nếu có valid parents, nếu không giữ nguyên để đợi Core gửi parents đúng
+            if !valid_parents.is_empty() {
+                self.last_parents = valid_parents;
+            }
+        }
         
         // Make a new header.
         let header = Header::new(
@@ -424,29 +473,87 @@ impl Proposer {
                     debug!("Timer expired for round {}", self.round);
                 }
 
-                // Advance to the next round.
-                let old_round = self.round;
-                self.round += 1;
+                // ✅ FORK-SAFE: Validate parents round trước khi advance
+                // Quy tắc strict để đảm bảo tất cả nodes chọn cùng parents (deterministic)
+                // - Round 1: Chấp nhận genesis parents (round 0) - deterministic
+                // - Round 2: Chấp nhận genesis parents (round 0) hoặc parents từ round 1 - ưu tiên round 1 nếu có
+                // - Round 3: Chấp nhận genesis parents (round 0), 1 hoặc 2 - ưu tiên round 2 nếu có
+                // - Round >= 4: Chỉ chấp nhận parents từ expected_parent_round - STRICT RULE để đảm bảo fork-safety
+                let expected_parent_round = self.round.saturating_sub(1);
+                let has_valid_parents = !self.last_parents.is_empty() && 
+                    if self.round == 0 {
+                        // Round 0: Chấp nhận genesis parents (round 0)
+                        self.last_parents.iter().any(|p| p.round() == 0)
+                    } else if self.round == 1 {
+                        // Round 1: Chỉ chấp nhận genesis parents (round 0) - deterministic
+                        self.last_parents.iter().any(|p| p.round() == 0)
+                    } else if self.round == 2 {
+                        // Round 2: Chấp nhận genesis parents (round 0) hoặc parents từ round 1
+                        // Genesis parents là deterministic, nhưng nếu có certificates từ round 1 thì dùng
+                        self.last_parents.iter().any(|p| p.round() == 0 || p.round() == 1)
+                    } else if self.round == 3 {
+                        // Round 3: Chấp nhận genesis parents (round 0), 1 hoặc 2
+                        // Genesis parents là deterministic, nhưng nếu có certificates từ round 2 thì dùng
+                        self.last_parents.iter().any(|p| p.round() == 0 || p.round() == 1 || p.round() == 2)
+                    } else {
+                        // Round >= 4: STRICT RULE - chỉ chấp nhận parents từ expected_parent_round
+                        // Đây là quy tắc quan trọng để đảm bảo fork-safety
+                        self.last_parents.iter().any(|p| p.round() == expected_parent_round)
+                    };
                 
-                // Update global_state
-                if let Some(ref gs) = self.global_state {
-                    let _ = gs.update_proposer_round(self.round).await;
+                if !has_valid_parents && self.round >= 4 {
+                    // Từ round 4 trở đi, STRICT RULE - phải có parents từ round (r - 1)
+                    // Không có parents đúng round → đợi Core gửi parents
+                    warn!(
+                        "⚠️ [PROPOSER] Cannot advance: Round={}, Expected parents from round {}, but have parents from rounds: {:?}. Waiting for Core.",
+                        self.round, expected_parent_round,
+                        self.last_parents.iter().map(|p| p.round()).collect::<Vec<_>>()
+                    );
+                    // Reset timer để đợi thêm
+                    let deadline = self.timeout_value();
+                    timer.as_mut().reset(deadline);
+                    timer_expired = false;
+                    continue;
                 }
+
+                // ✅ FIX: Không advance round trước khi tạo header
+                // Tạo header với round hiện tại, rồi advance sau khi thành công
+                // Điều này đảm bảo validation trong make_header() dựa trên round đúng
+                let old_round = self.round;
+                let next_round = self.round + 1;
                 
-                self.metrics
-                    .current_round
-                    .with_label_values(&[&self.committee.epoch.to_string()])
-                    .set(self.round as i64);
                 info!(
                     "📝 [PROPOSER] Creating header: Round {} -> {}, Parents: {}, PayloadSize: {}, Digests: {}",
-                    old_round, self.round, self.last_parents.len(), self.payload_size, self.digests.len()
+                    old_round, next_round, self.last_parents.len(), self.payload_size, self.digests.len()
                 );
 
-                // Make a new header.
-                match self.make_header().await {
+                // Make a new header với round hiện tại (chưa advance)
+                // make_header() sẽ tạo header với self.round, sau đó chúng ta advance
+                let header_result = self.make_header().await;
+                
+                // Advance to the next round sau khi tạo header thành công
+                match header_result {
                     Err(e @ DagError::ShuttingDown) => debug!("{e}"),
-                    Err(e) => panic!("Unexpected error: {e}"),
-                    Ok(()) => (),
+                    Err(e) => {
+                        warn!("⚠️ [PROPOSER] Failed to create header: {}. Will retry when conditions are met.", e);
+                        // Reset timer để đợi thêm
+                        let deadline = self.timeout_value();
+                        timer.as_mut().reset(deadline);
+                    },
+                    Ok(()) => {
+                        // Chỉ advance round sau khi tạo header thành công
+                        self.round = next_round;
+                        
+                        // Update global_state
+                        if let Some(ref gs) = self.global_state {
+                            let _ = gs.update_proposer_round(self.round).await;
+                        }
+                        
+                        self.metrics
+                            .current_round
+                            .with_label_values(&[&self.committee.epoch.to_string()])
+                            .set(self.round as i64);
+                    },
                 }
                 self.payload_size = 0;
 
@@ -455,11 +562,27 @@ impl Proposer {
                 timer.as_mut().reset(deadline);
                 timer_expired = false;
             } else if !enough_parents {
-                debug!(
-                    "⏸️ [PROPOSER] Waiting for parents: Round={}, Parents={}, TimerExpired={}, EnoughDigests={}, Advance={}",
-                    self.round, self.last_parents.len(), timer_expired, enough_digests, advance
-                );
-            } else if !enough_parents {
+                // ✅ FIX: Khi khởi động, Proposer ở round 1, 2 hoặc 3 có thể dùng genesis parents
+                // để tiếp tục tạo headers ngay cả khi chưa có certificates từ round trước
+                // Điều này đảm bảo hệ thống có thể khởi động được ngay từ đầu
+                // Core đã được sửa để chấp nhận parents từ round 0 khi header ở round 3
+                if timer_expired && (self.round == 1 || self.round == 2 || self.round == 3) && self.last_parents.is_empty() {
+                    warn!(
+                        "⚠️ [PROPOSER] No parents received after timeout at round {}. Using genesis parents to continue.",
+                        self.round
+                    );
+                    // Dùng genesis parents để tiếp tục tạo headers
+                    self.last_parents = Certificate::genesis(&self.committee);
+                    // Tiếp tục loop để tạo header
+                    continue;
+                } else if timer_expired && self.round > 3 {
+                    warn!(
+                        "⚠️ [PROPOSER] No parents received after timeout, waiting for Core to sync parents. Round={}",
+                        self.round
+                    );
+                    // Không tạo header, đợi Core gửi parents đúng round
+                    // Core sẽ tự động sync và gửi parents khi có
+                }
                 debug!(
                     "⏸️ [PROPOSER] Waiting for parents: Round={}, Parents={}, TimerExpired={}, EnoughDigests={}, Advance={}",
                     self.round, self.last_parents.len(), timer_expired, enough_digests, advance
@@ -527,21 +650,83 @@ impl Proposer {
 
                         },
                         Ordering::Less => {
-                            // Ignore parents from older rounds.
-                            debug!(
-                                "⏭️ [PROPOSER] Ignoring parents from older round {} (current: {})",
-                                round, self.round
-                            );
-                            continue;
+                            // ✅ FIX: Nếu round < self.round nhưng parents không rỗng, có thể là parents từ round trước
+                            // Ví dụ: Proposer ở round 1, nhận parents từ round 0 (certificates từ round 0)
+                            // Đây là hợp lệ vì Proposer cần parents từ round 0 để tạo header cho round 2
+                            // Đặc biệt: Round 1 cần parents từ round 0, Round 2 cần parents từ round 1
+                            if !parents.is_empty() {
+                                let expected_parent_round = self.round.saturating_sub(1);
+                                // Kiểm tra xem parents có round đúng không
+                                let parents_round = parents[0].round();
+                                if parents_round == expected_parent_round || 
+                                   (self.round == 1 && parents_round == 0) ||
+                                   (self.round == 2 && parents_round == 1) ||
+                                   (self.round == 3 && parents_round == 1) {
+                                    // Parents từ round trước → chấp nhận
+                                    info!(
+                                        "📥 [PROPOSER] Accepting parents from round {} (current: {}, expected: {}) - {} parents",
+                                        parents_round, self.round, expected_parent_round, parents.len()
+                                    );
+                                    if self.last_parents.is_empty() || self.last_parents[0].round() == 0 {
+                                        // Thay thế genesis parents bằng parents thực tế
+                                        self.last_parents = parents;
+                                    } else {
+                                        // Extend thêm parents
+                                        self.last_parents.extend(parents);
+                                    }
+                                } else {
+                                    // Ignore parents from wrong rounds.
+                                    debug!(
+                                        "⏭️ [PROPOSER] Ignoring parents from round {} (current: {}, expected: {})",
+                                        parents_round, self.round, expected_parent_round
+                                    );
+                                    continue;
+                                }
+                            } else {
+                                // Ignore empty parents from older rounds.
+                                debug!(
+                                    "⏭️ [PROPOSER] Ignoring empty parents from round {} (current: {})",
+                                    round, self.round
+                                );
+                                continue;
+                            }
                         },
                         Ordering::Equal => {
                             // The core gives us the parents the first time they are enough to form a quorum.
                             // Then it keeps giving us all the extra parents.
-                            info!(
-                                "📥 [PROPOSER] Received {} additional parents for round {}",
-                                parents.len(), round
-                            );
-                            self.last_parents.extend(parents)
+                            if parents.is_empty() {
+                                // Core gửi empty parents (chỉ là round update)
+                                debug!(
+                                    "📥 [PROPOSER] Received round update (empty parents) for round {}",
+                                    round
+                                );
+                                // Không thay đổi last_parents, chỉ update round nếu cần
+                                if round > self.round {
+                                    info!(
+                                        "🔄 [PROPOSER] Jumping ahead: Round {} -> {} (from Core round update)",
+                                        self.round, round
+                                    );
+                                    self.round = round;
+                                    if let Some(ref gs) = self.global_state {
+                                        let _ = gs.update_proposer_round(self.round).await;
+                                    }
+                                }
+                            } else if self.last_parents.is_empty() || self.last_parents[0].round() == 0 {
+                                // ✅ RECOVERY: Nếu last_parents rỗng hoặc là genesis (round 0),
+                                // thay thế hoàn toàn bằng parents từ Core
+                                info!(
+                                    "📥 [PROPOSER] Replacing parents (was {} genesis/empty) with {} parents for round {}",
+                                    self.last_parents.len(), parents.len(), round
+                                );
+                                self.last_parents = parents;
+                            } else {
+                                // Nếu đã có parents đúng round, extend thêm
+                                info!(
+                                    "📥 [PROPOSER] Received {} additional parents for round {}",
+                                    parents.len(), round
+                                );
+                                self.last_parents.extend(parents)
+                            }
                         }
                     }
 

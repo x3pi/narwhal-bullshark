@@ -15,7 +15,7 @@ use std::{
 };
 use storage::CertificateStore;
 use tokio::{sync::watch, task::JoinHandle};
-use tracing::{debug, info, instrument};
+use tracing::{info, instrument, warn};
 use types::{
     metered_channel, Certificate, CertificateDigest, ConsensusStore, ReconfigureNotification,
     Round, StoreResult,
@@ -314,6 +314,22 @@ where
                 "📤 [Consensus] Re-sending {} certificates from DAG",
                 certificates_to_resend.len()
             );
+            
+            // ✅ Detect missing certificates: Check if DAG has gaps
+            let max_round_in_dag = state.dag.keys().max().copied().unwrap_or(0);
+            let expected_rounds = max_round_in_dag.saturating_sub(state.last_committed_round);
+            if expected_rounds > certificates_to_resend.len() as u64 {
+                warn!(
+                    "⚠️ [Consensus] Potential missing certificates: Expected ~{} certificates from rounds {} to {}, but only found {}. DAG may be incomplete.",
+                    expected_rounds,
+                    state.last_committed_round + 1,
+                    max_round_in_dag,
+                    certificates_to_resend.len()
+                );
+                info!(
+                    "💡 [Consensus] System will continue and sync missing certificates from peers as needed"
+                );
+            }
             
             // ✅ Đảm bảo xử lý theo thứ tự round để tránh fork
             for certificate in certificates_to_resend {

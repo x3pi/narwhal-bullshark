@@ -20,3 +20,5 @@ mod serde;
 
 pub mod bounded_future_queue;
 pub mod metered_channel;
+pub mod global_state;
+pub use global_state::*;

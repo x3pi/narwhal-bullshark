@@ -7,7 +7,7 @@
 use crate::{metrics::ConsensusMetrics, ConsensusOutput, SequenceNumber};
 use config::Committee;
 use crypto::PublicKey;
-use fastcrypto::{hash::Hash, traits::EncodeDecodeBase64};
+use fastcrypto::hash::Hash;
 use std::{
     cmp::{max, Ordering},
     collections::HashMap,
@@ -15,7 +15,7 @@ use std::{
 };
 use storage::CertificateStore;
 use tokio::{sync::watch, task::JoinHandle};
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 use types::{
     metered_channel, Certificate, CertificateDigest, ConsensusStore, ReconfigureNotification,
     Round, StoreResult,
@@ -130,8 +130,8 @@ impl ConsensusState {
 
     /// Update and clean up internal state base on committed certificates.
     pub fn update(&mut self, certificate: &Certificate, gc_depth: Round) {
-        let cert_round = certificate.round();
-        let old_last_committed = self.last_committed_round;
+        let _cert_round = certificate.round();
+        let _old_last_committed = self.last_committed_round;
         
         self.last_committed
             .entry(certificate.origin())
@@ -198,6 +198,12 @@ pub struct Consensus<ConsensusProtocol> {
 
     /// Metrics handler
     metrics: Arc<ConsensusMetrics>,
+    
+    /// Garbage collection depth for state updates
+    gc_depth: Round,
+    
+    /// Global state manager for centralized state management
+    global_state: Option<Arc<dyn types::GlobalStateManager>>,
 }
 
 impl<Protocol> Consensus<Protocol>
@@ -216,12 +222,40 @@ where
         protocol: Protocol,
         metrics: Arc<ConsensusMetrics>,
         gc_depth: Round,
+        global_state: Option<Arc<dyn types::GlobalStateManager>>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let consensus_index = store
+            // Load state từ global_state nếu có
+            let mut consensus_index = store
                 .read_last_consensus_index()
                 .expect("Failed to load consensus index from store");
-            let recovered_last_committed = store.read_last_committed();
+            let mut recovered_last_committed = store.read_last_committed();
+            
+            if let Some(ref gs) = global_state {
+                let state_snapshot = gs.get_state().await;
+                // Restore state từ global_state nếu có
+                if state_snapshot.last_consensus_index > consensus_index {
+                    consensus_index = state_snapshot.last_consensus_index;
+                    info!(
+                        "✅ [Consensus] Restored consensus_index from global_state: {}",
+                        consensus_index
+                    );
+                }
+                if state_snapshot.last_committed_round > 0 {
+                    // Merge last_committed từ global_state
+                    for (authority, round) in state_snapshot.last_committed {
+                        recovered_last_committed
+                            .entry(authority)
+                            .and_modify(|r| *r = (*r).max(round))
+                            .or_insert(round);
+                    }
+                    info!(
+                        "✅ [Consensus] Restored last_committed_round from global_state: {}",
+                        state_snapshot.last_committed_round
+                    );
+                }
+            }
+            
             Self {
                 committee,
                 rx_reconfigure,
@@ -231,6 +265,8 @@ where
                 consensus_index,
                 protocol,
                 metrics,
+                gc_depth,
+                global_state,
             }
             .run(recovered_last_committed, cert_store, gc_depth)
             .await
@@ -265,6 +301,93 @@ where
             gc_depth,
         )
         .await;
+
+        // ✅ Re-send certificates từ DAG sau recovery để trigger consensus processing
+        if state.last_committed_round > 0 {
+            info!(
+                "🔄 [Consensus] Re-sending certificates from DAG after recovery (last_committed_round: {})",
+                state.last_committed_round
+            );
+            
+            let certificates_to_resend = self.resend_certificates_from_dag(&state)?;
+            info!(
+                "📤 [Consensus] Re-sending {} certificates from DAG",
+                certificates_to_resend.len()
+            );
+            
+            // ✅ Đảm bảo xử lý theo thứ tự round để tránh fork
+            for certificate in certificates_to_resend {
+                let cert_round = certificate.round();
+                
+                info!(
+                    "🔍 [Consensus] Processing certificate from DAG: Round={}, LastCommittedRound={}, ConsensusIndex={}",
+                    cert_round, state.last_committed_round, self.consensus_index
+                );
+                
+                // ✅ Kiểm tra lại: Skip nếu certificate đã được commit (double-check)
+                if cert_round <= state.last_committed_round {
+                    info!(
+                        "⏭️ [Consensus] Skipping certificate round {} (already committed, last_committed_round: {})",
+                        cert_round, state.last_committed_round
+                    );
+                    continue;
+                }
+                
+                let sequence = self.protocol
+                    .process_certificate(&mut state, self.consensus_index, certificate)?;
+                
+                let old_consensus_index = self.consensus_index;
+                let old_last_committed_round = state.last_committed_round;
+                self.consensus_index += sequence.len() as u64;
+                
+                // ✅ Log kết quả processing
+                if sequence.is_empty() {
+                    info!(
+                        "⚠️ [Consensus] Re-processed round {}: No certificates committed (sequence empty). LastCommittedRound={}, ConsensusIndex={}",
+                        cert_round, state.last_committed_round, self.consensus_index
+                    );
+                } else {
+                    // ✅ Update last_committed_round sau mỗi commit để đảm bảo không duplicate
+                    // Update state sau khi commit
+                    for output in &sequence {
+                        state.update(&output.certificate, self.gc_depth);
+                        
+                        // Update global_state
+                        if let Some(ref gs) = self.global_state {
+                            let _ = gs.update_last_committed_round(state.last_committed_round).await;
+                            let _ = gs.update_last_committed(
+                                output.certificate.origin(),
+                                output.certificate.round()
+                            ).await;
+                        }
+                    }
+                    
+                    // Update consensus_index trong global_state
+                    if let Some(ref gs) = self.global_state {
+                        let _ = gs.update_consensus_index(self.consensus_index).await;
+                    }
+                    
+                    info!(
+                        "✅ [Consensus] Re-processed round {}: {} certificate(s) committed, ConsensusIndex {} -> {}, LastCommittedRound {} -> {}",
+                        cert_round, sequence.len(), old_consensus_index, self.consensus_index,
+                        old_last_committed_round, state.last_committed_round
+                    );
+                }
+                
+                // Output the sequence in the right order.
+                for output in sequence {
+                    let certificate = &output.certificate;
+                    self.tx_primary
+                        .send(certificate.clone())
+                        .await
+                        .expect("Failed to send certificate to primary");
+                    
+                    if let Err(e) = self.tx_output.send(output).await {
+                        tracing::warn!("Failed to output certificate: {e}");
+                    }
+                }
+            }
+        }
 
         // Listen to incoming certificates.
         loop {
@@ -304,12 +427,32 @@ where
 
                     // Update the consensus index.
                     let old_consensus_index = self.consensus_index;
+                    let old_last_committed_round = state.last_committed_round;
                     self.consensus_index += sequence.len() as u64;
                     
-                    // Log khi có certificates được commit (ẩn để giảm log)
+                    // ✅ Update state sau mỗi commit để đảm bảo không duplicate và không fork
                     if !sequence.is_empty() {
-                        tracing::debug!("📊 [Consensus] Round {} processed: {} certificate(s) committed, ConsensusIndex {} -> {} (LastCommittedRound: {})", 
-                            cert_round, sequence.len(), old_consensus_index, self.consensus_index, state.last_committed_round);
+                        for output in &sequence {
+                            state.update(&output.certificate, self.gc_depth);
+                            
+                            // Update global_state
+                            if let Some(ref gs) = self.global_state {
+                                let _ = gs.update_last_committed_round(state.last_committed_round).await;
+                                let _ = gs.update_last_committed(
+                                    output.certificate.origin(),
+                                    output.certificate.round()
+                                ).await;
+                            }
+                        }
+                        
+                        // Update consensus_index trong global_state
+                        if let Some(ref gs) = self.global_state {
+                            let _ = gs.update_consensus_index(self.consensus_index).await;
+                        }
+                        
+                        tracing::debug!("📊 [Consensus] Round {} processed: {} certificate(s) committed, ConsensusIndex {} -> {}, LastCommittedRound {} -> {}", 
+                            cert_round, sequence.len(), old_consensus_index, self.consensus_index,
+                            old_last_committed_round, state.last_committed_round);
                     }
 
                     // Output the sequence in the right order.
@@ -375,5 +518,50 @@ where
                 }
             }
         }
+    }
+    
+    /// Re-send certificates từ DAG sau recovery để trigger consensus processing
+    fn resend_certificates_from_dag(
+        &self,
+        state: &ConsensusState,
+    ) -> StoreResult<Vec<Certificate>> {
+        let mut certificates = Vec::new();
+        
+        // Lấy certificates từ round > last_committed_round
+        let start_round = state.last_committed_round + 1;
+        let end_round = state.dag.keys().max().copied().unwrap_or(start_round);
+        
+        if start_round > end_round {
+            // Không có certificates mới
+            return Ok(certificates);
+        }
+        
+        info!(
+            "🔍 [Consensus] Scanning DAG for certificates: rounds {} to {}",
+            start_round, end_round
+        );
+        
+        for round in start_round..=end_round {
+            if let Some(round_certs) = state.dag.get(&round) {
+                for (_, (_, cert)) in round_certs.iter() {
+                    // Chỉ gửi certificates chưa commit
+                    if cert.round() > state.last_committed_round {
+                        certificates.push(cert.clone());
+                    }
+                }
+            }
+        }
+        
+        // Sắp xếp theo round để đảm bảo thứ tự
+        certificates.sort_by_key(|c| c.round());
+        
+        info!(
+            "📋 [Consensus] Found {} certificates to re-send (rounds {} to {})",
+            certificates.len(),
+            start_round,
+            end_round
+        );
+        
+        Ok(certificates)
     }
 }

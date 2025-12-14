@@ -48,6 +48,7 @@ impl ConsensusProtocol for Bullshark {
 
         // We only elect leaders for even round numbers.
         if r % 2 != 0 || r < 2 {
+            debug!("[CONSENSUS] Round {}: r={} is not even or < 2, skipping leader election", round, r);
             return Ok(Vec::new());
         }
 
@@ -65,16 +66,23 @@ impl ConsensusProtocol for Bullshark {
                 x
             },
             None => {
-                warn!("⚠️ [CONSENSUS] No leader found at round {} (current round: {})", leader_round, round);
+                warn!("⚠️ [CONSENSUS] No leader found at round {} (current round: {}). DAG has rounds: {:?}", 
+                    leader_round, round, state.dag.keys().collect::<Vec<_>>());
                 return Ok(Vec::new());
             },
         };
 
         // Check if the leader has f+1 support from its children (ie. round r-1).
-        let stake: Stake = state
-            .dag
-            .get(&round)
-            .expect("We should have the whole history by now")
+        // Note: We need certificates from round `round` (not round-1) to support leader at round `r`
+        let round_certs = state.dag.get(&round);
+        if round_certs.is_none() {
+            warn!("⚠️ [CONSENSUS] No certificates at round {} to support leader round {}. DAG has rounds: {:?}", 
+                round, leader_round, state.dag.keys().collect::<Vec<_>>());
+            return Ok(Vec::new());
+        }
+        
+        let stake: Stake = round_certs
+            .unwrap()
             .values()
             .filter(|(_, x)| x.header.parents.contains(leader_digest))
             .map(|(_, x)| self.committee.stake(&x.origin()))
@@ -84,9 +92,16 @@ impl ConsensusProtocol for Bullshark {
         // the last committed leader, and commit all preceding leaders in the right order. Committing
         // a leader block means committing all its dependencies.
         if stake < self.committee.validity_threshold() {
+            let round_cert_count = round_certs.unwrap().len();
+            let supporting_certs: Vec<_> = round_certs
+                .unwrap()
+                .values()
+                .filter(|(_, x)| x.header.parents.contains(leader_digest))
+                .map(|(_, x)| x.origin())
+                .collect();
             warn!(
-                "⚠️ [CONSENSUS] Leader at round {} does not have enough support: Stake={}, Threshold={}, LeaderDigest={:?}",
-                leader_round, stake, self.committee.validity_threshold(), leader_digest
+                "⚠️ [CONSENSUS] Leader at round {} does not have enough support: Stake={}, Threshold={}, LeaderDigest={:?}, Round{}CertCount={}, SupportingCerts={:?}",
+                leader_round, stake, self.committee.validity_threshold(), leader_digest, round, round_cert_count, supporting_certs
             );
             return Ok(Vec::new());
         }

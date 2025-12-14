@@ -94,6 +94,7 @@ impl Primary {
         registry: &Registry,
         // See comments in Subscriber::spawn
         rx_executor_network: Option<oneshot::Sender<P2pNetwork>>,
+        global_state: Option<Arc<dyn types::GlobalStateManager>>,
     ) -> Vec<JoinHandle<()>> {
         // Write the parameters to the logs.
         parameters.tracing();
@@ -315,6 +316,7 @@ impl Primary {
             node_metrics.clone(),
             /* tx_proposer_certified */ tx_proposer_certified.clone(),
             core_primary_network,
+            global_state.clone(),
         );
         // Receives batch digests from other workers. They are only used to validate headers.
         let payload_receiver_handle = PayloadReceiver::spawn(
@@ -432,6 +434,7 @@ impl Primary {
             parameters.gc_depth,
             /* rx_sequenced */ rx_proposer_sequenced,
             /* rx_certified */ rx_proposer_certified,
+            global_state.clone(),
         );
 
         // The `Helper` is dedicated to reply to certificates & payload availability requests
@@ -458,6 +461,7 @@ impl Primary {
             tx_reconfigure,
             P2pNetwork::new(network),
             tx_proposer_sequenced,
+            global_state.clone(),
         );
 
         let consensus_api_handle = if !internal_consensus {

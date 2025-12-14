@@ -58,6 +58,7 @@ sha3 = "0.10.6"
 serde-reflection = "0.3.6"
 serde_yaml = "0.8.26"
 structopt = "0.3.26"
+tempfile = "3.8"
 test-utils = { path = "../test-utils", package = "narwhal-test-utils" }
 
 [features]

@@ -642,6 +642,8 @@ pub struct UdsExecutionState {
     catch_up_check_interval: Duration,
     /// Counter for persistence (persist every N certificates)
     persistence_counter: Arc<Mutex<u64>>,
+    /// Global state manager for centralized state management
+    global_state: Option<Arc<crate::global_state::GlobalStateManager>>,
 }
 
 impl BlockBuilder {
@@ -889,6 +891,7 @@ impl UdsExecutionState {
             None::<PathBuf>, // execution_state_path
             None::<Arc<ConsensusStore>>, // consensus_store
             None::<CertificateStore>, // certificate_store
+            None, // global_state
         )
     }
 
@@ -903,6 +906,7 @@ impl UdsExecutionState {
         execution_state_path: Option<PathBuf>,
         consensus_store: Option<Arc<ConsensusStore>>,
         certificate_store: Option<CertificateStore>,
+        global_state: Option<Arc<crate::global_state::GlobalStateManager>>,
     ) -> Self {
         info!("🚀 [UDS] Creating UdsExecutionState: socket_path='{}', epoch={}, empty_block_timeout_ms={}, max_retries={}, retry_delay_base_ms={}, missed_batch_timeout_ms={}, max_missed_batch_retries={}, execution_state_path={:?}", 
             socket_path, epoch, empty_block_timeout_ms, max_send_retries, retry_delay_base_ms, missed_batch_timeout_ms, max_missed_batch_retries, execution_state_path);
@@ -927,15 +931,56 @@ impl UdsExecutionState {
             catch_up_threshold: 50, // Default: 50 certificates lag
             catch_up_check_interval: Duration::from_secs(10), // Default: 10 seconds
             persistence_counter: Arc::new(Mutex::new(0)),
+            global_state,
+        }
+    }
+    
+    /// Helper function để update global_state
+    async fn update_global_state(&self) {
+        if let Some(ref gs) = self.global_state {
+            let last_consensus_index = *self.last_consensus_index.lock().await;
+            let last_sent_height = *self.last_sent_height.lock().await;
+            
+            // Update global_state
+            let _ = gs.update_consensus_index(last_consensus_index).await;
+            if let Some(height) = last_sent_height {
+                let _ = gs.update_last_sent_height(height).await;
+            }
         }
     }
 
     /// Initialize execution state by loading from disk
     /// This should be called after construction to load persisted state
     pub async fn initialize(&self) -> Result<(), String> {
-        let loaded_state = self.load_execution_state().await?;
+        // Load từ global_state trước (nếu có), sau đó load từ disk
+        let mut loaded_state = self.load_execution_state().await?;
+        
+        // Override với global_state nếu có và global_state có giá trị lớn hơn
+        if let Some(ref gs) = self.global_state {
+            let state_snapshot = gs.get_state().await;
+            if state_snapshot.last_consensus_index > loaded_state.last_consensus_index {
+                loaded_state.last_consensus_index = state_snapshot.last_consensus_index;
+                info!(
+                    "✅ [UDS] Override last_consensus_index from global_state: {}",
+                    loaded_state.last_consensus_index
+                );
+            }
+            if state_snapshot.last_sent_height.is_some() && (loaded_state.last_sent_height.is_none() || 
+                state_snapshot.last_sent_height.unwrap() > loaded_state.last_sent_height.unwrap()) {
+                loaded_state.last_sent_height = state_snapshot.last_sent_height;
+                info!(
+                    "✅ [UDS] Override last_sent_height from global_state: {:?}",
+                    loaded_state.last_sent_height
+                );
+            }
+        }
+        
         *self.last_consensus_index.lock().await = loaded_state.last_consensus_index;
         *self.last_sent_height.lock().await = loaded_state.last_sent_height;
+        
+        // Update global_state với state đã load
+        self.update_global_state().await;
+        
         info!("✅ [UDS] Initialized execution state: last_consensus_index={}, last_sent_height={:?}", 
             loaded_state.last_consensus_index, loaded_state.last_sent_height);
         Ok(())
@@ -1491,6 +1536,9 @@ impl UdsExecutionState {
             }
             *self.last_sent_height.lock().await = Some(height);
         }
+        
+        // Update global_state sau khi fill gaps
+        self.update_global_state().await;
 
         uds_debug!("✅ [UDS] Successfully filled gaps: {} empty blocks sent", gap_count);
         Ok(())
@@ -1610,6 +1658,9 @@ impl ExecutionState for UdsExecutionState {
             *last_consensus_guard = consensus_index;
         }
         drop(last_consensus_guard);
+        
+        // Update global_state
+        self.update_global_state().await;
         
         // Periodic persistence: persist every 10 certificates
         // Note: Persistence is done synchronously but quickly (just file I/O)
@@ -2199,6 +2250,11 @@ impl ExecutionState for UdsExecutionState {
                             block_to_send.height > last_sent_guard.unwrap();
                         if should_update {
                             *last_sent_guard = Some(block_to_send.height);
+                            drop(last_sent_guard);
+                            // Update global_state
+                            self.update_global_state().await;
+                        } else {
+                            drop(last_sent_guard);
                         }
                     }
                 }
@@ -2319,6 +2375,9 @@ impl ExecutionState for UdsExecutionState {
                                 *last_sent_guard = Some(block_to_send.height);
                             }
                             drop(last_sent_guard);
+                            
+                            // Update global_state
+                            self.update_global_state().await;
                             
                             // Persist state after sending block successfully
                             if let Err(e) = self.persist_execution_state().await {
@@ -2470,10 +2529,13 @@ impl UdsExecutionState {
             if should_send {
                 *last_sent_guard = Some(block_to_send.height);
             }
+            drop(last_sent_guard);
             should_send
         };
         
         if final_should_send {
+            // Update global_state
+            self.update_global_state().await;
             // OPTIMIZATION: Sử dụng trace_hashes đã collect trước đó thay vì loop lại
             match self.send_block_with_retry(block_to_send.clone(), tx_hash_map.clone(), batch_digests.clone()).await {
                 Err(e) => {
@@ -2660,6 +2722,9 @@ impl UdsExecutionState {
                             if should_update {
                                 *last_sent_guard = Some(block_to_send.height);
                                 
+                                // Update global_state
+                                self.update_global_state().await;
+                                
                                 if !block_to_send.transactions.is_empty() {
                                     info!("✅ [UDS] Block {} sent successfully with {} transactions", 
                                         block_to_send.height, block_to_send.transactions.len());
@@ -2712,6 +2777,11 @@ impl UdsExecutionState {
             let should_update = last_sent_guard.is_none() || height > last_sent_guard.unwrap();
             if should_update {
                 *last_sent_guard = Some(height);
+                drop(last_sent_guard);
+                // Update global_state
+                self.update_global_state().await;
+            } else {
+                drop(last_sent_guard);
             }
         }
         Ok(())

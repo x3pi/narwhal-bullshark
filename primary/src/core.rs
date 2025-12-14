@@ -88,6 +88,8 @@ pub struct Core {
     cancel_handlers: HashMap<Round, Vec<CancelOnDropHandler<anyhow::Result<anemo::Response<()>>>>>,
     /// Metrics handler
     metrics: Arc<PrimaryMetrics>,
+    /// Global state manager for centralized state management
+    global_state: Option<Arc<dyn types::GlobalStateManager>>,
 }
 
 impl Core {
@@ -114,8 +116,20 @@ impl Core {
         metrics: Arc<PrimaryMetrics>,
         tx_proposer_certified: Sender<Header>,
         primary_network: P2pNetwork,
+        global_state: Option<Arc<dyn types::GlobalStateManager>>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
+            // Load state từ global_state nếu có
+            let mut gc_round = 0;
+            if let Some(ref gs) = global_state {
+                let state_snapshot = gs.get_state().await;
+                gc_round = state_snapshot.core_gc_round;
+                info!(
+                    "✅ [Core] Restored gc_round from global_state: {}",
+                    gc_round
+                );
+            }
+            
             Self {
                 name,
                 committee,
@@ -134,7 +148,7 @@ impl Core {
                 tx_consensus,
                 tx_proposer,
                 tx_proposer_certified,
-                gc_round: 0,
+                gc_round,
                 processing: HashMap::with_capacity(2 * gc_depth as usize),
                 current_header: Header::default(),
                 vote_digest_store,
@@ -143,6 +157,7 @@ impl Core {
                 network: primary_network,
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 metrics,
+                global_state,
             }
             .run()
             .await;
@@ -421,6 +436,10 @@ impl Core {
         //
         // This allows the proposer not to fire proposals at rounds strictly below the certificate we witnessed.
         let minimal_round_for_parents = certificate.round().saturating_sub(1);
+        debug!(
+            "📤 [CORE] Sending minimal_round update to Proposer: Round={} (from certificate round {})",
+            minimal_round_for_parents, certificate.round()
+        );
         self.tx_proposer
             .send((vec![], minimal_round_for_parents, certificate.epoch()))
             .await
@@ -476,6 +495,10 @@ impl Core {
             .append(certificate.clone(), &self.committee)
         {
             // Send it to the `Proposer`.
+            info!(
+                "📤 [CORE] Sending {} parents to Proposer: Round={}, CertificateRound={}",
+                parents.len(), certificate.round(), certificate.round()
+            );
             self.tx_proposer
                 .send((parents, certificate.round(), certificate.epoch()))
                 .await
@@ -702,6 +725,11 @@ impl Core {
                         self.certificates_aggregators.retain(|k, _| k > &gc_round);
                         self.cancel_handlers.retain(|k, _| k > &gc_round);
                         self.gc_round = gc_round;
+                        
+                        // Update global_state
+                        if let Some(ref gs) = self.global_state {
+                            let _ = gs.update_core_gc_round(gc_round).await;
+                        }
 
                         self.metrics
                             .gc_core_latency

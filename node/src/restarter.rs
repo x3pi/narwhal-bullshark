@@ -78,6 +78,7 @@ impl NodeRestarter {
                 parameters.clone(),
                 /* consensus */ true,
                 execution_state.clone(),
+                None, // global_state - restarter không có global_state
                 registry,
             )
             .await

@@ -32,6 +32,7 @@ use types::{
 use worker::{metrics::initialise_metrics, Worker};
 
 pub mod execution_state;
+pub mod global_state;
 pub mod metrics;
 pub mod restarter;
 
@@ -148,6 +149,8 @@ impl Node {
         internal_consensus: bool,
         // The state used by the client to execute transactions.
         execution_state: Arc<State>,
+        // Global state manager for centralized state management
+        global_state: Option<Arc<global_state::GlobalStateManager>>,
         // A prometheus exporter Registry to use for the metrics
         registry: &Registry,
     ) -> SubscriberResult<Vec<JoinHandle<()>>>
@@ -207,6 +210,7 @@ impl Node {
                 &tx_reconfigure,
                 rx_new_certificates,
                 tx_consensus.clone(),
+                global_state.clone(),
                 registry,
             )
             .await?;
@@ -251,6 +255,7 @@ impl Node {
             tx_consensus,
             registry,
             Some(rx_executor_network),
+            global_state.clone().map(|gs| gs as Arc<dyn types::GlobalStateManager>),
         );
         handles.extend(primary_handles);
 
@@ -287,6 +292,7 @@ impl Node {
         tx_reconfigure: &watch::Sender<ReconfigureNotification>,
         rx_new_certificates: metered_channel::Receiver<Certificate>,
         tx_feedback: metered_channel::Sender<Certificate>,
+        global_state: Option<Arc<global_state::GlobalStateManager>>,
         registry: &Registry,
     ) -> SubscriberResult<Vec<JoinHandle<()>>>
     where
@@ -338,6 +344,7 @@ impl Node {
             ordering_engine,
             consensus_metrics.clone(),
             parameters.gc_depth,
+            global_state.clone().map(|gs| gs as Arc<dyn types::GlobalStateManager>),
         );
 
 

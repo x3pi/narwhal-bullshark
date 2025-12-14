@@ -12,7 +12,7 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, Duration, Instant},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use types::{
     error::{DagError, DagResult},
     metered_channel::{Receiver, Sender},
@@ -78,6 +78,8 @@ pub struct Proposer {
     /// This allows tracking InFlight batches from all certified headers (not just our own).
     /// All nodes see the same certified headers → same InFlight state → fork-safe.
     rx_certified: Receiver<Header>,
+    /// Global state manager for centralized state management
+    global_state: Option<Arc<dyn types::GlobalStateManager>>,
 }
 
 impl Proposer {
@@ -98,9 +100,21 @@ impl Proposer {
         gc_depth: Round,
         rx_sequenced: Receiver<Certificate>,
         rx_certified: Receiver<Header>,
+        global_state: Option<Arc<dyn types::GlobalStateManager>>,
     ) -> JoinHandle<()> {
         let genesis = Certificate::genesis(&committee);
         tokio::spawn(async move {
+            // Load state từ global_state nếu có
+            let mut round = 0;
+            if let Some(ref gs) = global_state {
+                let state_snapshot = gs.get_state().await;
+                round = state_snapshot.proposer_round;
+                info!(
+                    "✅ [Proposer] Restored proposer_round from global_state: {}",
+                    round
+                );
+            }
+            
             Self {
                 name,
                 committee,
@@ -112,7 +126,7 @@ impl Proposer {
                 rx_core,
                 rx_workers,
                 tx_core,
-                round: 0,
+                round,
                 last_parents: genesis,
                 last_leader: None,
                 digests: Vec::with_capacity(2 * header_size),
@@ -123,6 +137,7 @@ impl Proposer {
                 gc_depth,
                 rx_sequenced,
                 rx_certified,
+                global_state,
             }
             .run()
             .await;
@@ -410,12 +425,22 @@ impl Proposer {
                 }
 
                 // Advance to the next round.
+                let old_round = self.round;
                 self.round += 1;
+                
+                // Update global_state
+                if let Some(ref gs) = self.global_state {
+                    let _ = gs.update_proposer_round(self.round).await;
+                }
+                
                 self.metrics
                     .current_round
                     .with_label_values(&[&self.committee.epoch.to_string()])
                     .set(self.round as i64);
-                debug!("Dag moved to round {}", self.round);
+                info!(
+                    "📝 [PROPOSER] Creating header: Round {} -> {}, Parents: {}, PayloadSize: {}, Digests: {}",
+                    old_round, self.round, self.last_parents.len(), self.payload_size, self.digests.len()
+                );
 
                 // Make a new header.
                 match self.make_header().await {
@@ -429,6 +454,16 @@ impl Proposer {
                 let deadline = self.timeout_value();
                 timer.as_mut().reset(deadline);
                 timer_expired = false;
+            } else if !enough_parents {
+                debug!(
+                    "⏸️ [PROPOSER] Waiting for parents: Round={}, Parents={}, TimerExpired={}, EnoughDigests={}, Advance={}",
+                    self.round, self.last_parents.len(), timer_expired, enough_digests, advance
+                );
+            } else if !enough_parents {
+                debug!(
+                    "⏸️ [PROPOSER] Waiting for parents: Round={}, Parents={}, TimerExpired={}, EnoughDigests={}, Advance={}",
+                    self.round, self.last_parents.len(), timer_expired, enough_digests, advance
+                );
             }
 
             tokio::select! {
@@ -472,21 +507,40 @@ impl Proposer {
                     }
 
                     // Compare the parents' round number with our current round.
+                    let old_round = self.round;
                     match round.cmp(&self.round) {
                         Ordering::Greater => {
                             // We accept round bigger than our current round to jump ahead in case we were
                             // late (or just joined the network).
+                            info!(
+                                "🔄 [PROPOSER] Jumping ahead: Round {} -> {} (received {} parents from Core)",
+                                self.round, round, parents.len()
+                            );
                             self.round = round;
+                            
+                            // Update global_state
+                            if let Some(ref gs) = self.global_state {
+                                let _ = gs.update_proposer_round(self.round).await;
+                            }
+                            
                             self.last_parents = parents;
 
                         },
                         Ordering::Less => {
                             // Ignore parents from older rounds.
+                            debug!(
+                                "⏭️ [PROPOSER] Ignoring parents from older round {} (current: {})",
+                                round, self.round
+                            );
                             continue;
                         },
                         Ordering::Equal => {
                             // The core gives us the parents the first time they are enough to form a quorum.
                             // Then it keeps giving us all the extra parents.
+                            info!(
+                                "📥 [PROPOSER] Received {} additional parents for round {}",
+                                parents.len(), round
+                            );
                             self.last_parents.extend(parents)
                         }
                     }
@@ -494,6 +548,13 @@ impl Proposer {
                     // Check whether we can advance to the next round. Note that if we timeout,
                     // we ignore this check and advance anyway.
                     advance = self.ready();
+                    
+                    if old_round != self.round {
+                        info!(
+                            "✅ [PROPOSER] Updated: Round {} -> {}, Parents: {}, Ready: {}",
+                            old_round, self.round, self.last_parents.len(), advance
+                        );
+                    }
                 }
 
                 // Receive digests from our workers.

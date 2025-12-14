@@ -38,6 +38,8 @@ pub struct StateHandler {
     /// This allows Proposer to cleanup InFlight batches.
     /// All nodes receive the same certificates in the same order → deterministic cleanup → fork-safe.
     tx_proposer_sequenced: Sender<Certificate>,
+    /// Global state manager for centralized state management
+    global_state: Option<Arc<dyn types::GlobalStateManager>>,
 }
 
 impl StateHandler {
@@ -52,8 +54,20 @@ impl StateHandler {
         tx_reconfigure: watch::Sender<ReconfigureNotification>,
         network: P2pNetwork,
         tx_proposer_sequenced: Sender<Certificate>,
+        global_state: Option<Arc<dyn types::GlobalStateManager>>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
+            // Load state từ global_state nếu có
+            let mut last_committed_round = 0;
+            if let Some(ref gs) = global_state {
+                let state_snapshot = gs.get_state().await;
+                last_committed_round = state_snapshot.last_committed_round;
+                info!(
+                    "✅ [StateHandler] Restored last_committed_round from global_state: {}",
+                    last_committed_round
+                );
+            }
+            
             Self {
                 name,
                 committee,
@@ -62,9 +76,10 @@ impl StateHandler {
                 tx_consensus_round_updates,
                 rx_reconfigure,
                 tx_reconfigure,
-                last_committed_round: 0,
+                last_committed_round,
                 network,
                 tx_proposer_sequenced,
+                global_state,
             }
             .run()
             .await;
@@ -82,6 +97,11 @@ impl StateHandler {
         let round = certificate.round();
         if round > self.last_committed_round {
             self.last_committed_round = round;
+
+            // Update global_state
+            if let Some(ref gs) = self.global_state {
+                let _ = gs.update_last_committed_round(round).await;
+            }
 
             // FORK-SAFE: Notify Proposer about sequenced certificate to cleanup InFlight batches.
             // All nodes receive the same certificates in the same order → deterministic cleanup → fork-safe.

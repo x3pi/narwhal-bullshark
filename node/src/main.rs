@@ -19,6 +19,7 @@ use futures::future::join_all;
 use narwhal_node as node;
 use node::{
     execution_state::{SimpleExecutionState, UdsExecutionState},
+    global_state,
     metrics::{primary_metrics_registry, start_prometheus_server, worker_metrics_registry},
     Node, NodeStorage,
 };
@@ -266,6 +267,26 @@ async fn run(
     // Make the data store.
     let store = NodeStorage::reopen(store_path);
 
+    // Create GlobalStateManager
+    let global_state_path = std::path::PathBuf::from(store_path).join("global_state.json");
+    let mut global_state = Arc::new(global_state::GlobalStateManager::new(
+        global_state_path,
+        10, // persistence_interval: persist mỗi 10 updates
+    ));
+
+    // Load state từ disk
+    if let Err(e) = global_state.load_from_disk().await {
+        warn!("⚠️ [GlobalState] Failed to load state from disk: {}, starting fresh", e);
+    } else {
+        let state = global_state.get_state().await;
+        info!(
+            "✅ [GlobalState] Loaded state: last_committed_round={}, proposer_round={}, last_consensus_index={}",
+            state.last_committed_round,
+            state.proposer_round,
+            state.last_consensus_index
+        );
+    }
+
     // The channel returning the result for each transaction's execution.
     let (tx_transaction_confirmation, rx_transaction_confirmation) =
         channel(Node::CHANNEL_CAPACITY);
@@ -293,6 +314,7 @@ async fn run(
                     Some(execution_state_path), // execution_state_path
                     Some(store.consensus_store.clone()), // consensus_store
                     Some(store.certificate_store.clone()), // certificate_store
+                    Some(global_state.clone()), // global_state
                 ));
                 
                 // Initialize execution state (load from disk)
@@ -313,6 +335,7 @@ async fn run(
                     /* consensus */ !sub_matches.is_present("consensus-disabled"),
                     /* execution_state */
                     uds_state,
+                    Some(global_state.clone()),
                     &registry,
                 )
                 .await?
@@ -327,6 +350,7 @@ async fn run(
                     /* consensus */ !sub_matches.is_present("consensus-disabled"),
                     /* execution_state */
                     Arc::new(SimpleExecutionState::new(tx_transaction_confirmation)),
+                    Some(global_state.clone()),
                     &registry,
                 )
                 .await?
